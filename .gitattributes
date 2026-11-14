@@ -1,0 +1,7 @@
+# Keep the repository text files LF so the Linux CI checkout matches the
+# local sources exactly.
+* text=auto eol=lf
+
+*.apk binary
+*.png binary
+*.jpg binary

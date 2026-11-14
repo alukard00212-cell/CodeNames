@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local virtual environments
+.venv/
+kivy_venv/
+venv/
+
+# Buildozer / Android output
+.buildozer/
+bin/
+*.apk
+*.aab
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+shots/
+*.log
