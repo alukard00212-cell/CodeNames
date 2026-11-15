@@ -16,6 +16,11 @@ version = 1.0
 # segno draws the join QR code with pure Python, no image assets.
 requirements = python3,kivy,segno
 
+# p4a's master branch creates a venv and runs `pip install -U pip` inside
+# it; on Python 3.14 that venv's pip is broken (ImportError: capture_logging).
+# develop installs pure-Python deps with the hostpython pip instead.
+p4a.branch = develop
+
 orientation = all
 fullscreen = 0
 
