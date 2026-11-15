@@ -1,4 +1,5 @@
 import random
+import threading
 
 from kivy.animation import Animation
 from kivy.app import App
@@ -19,7 +20,14 @@ from kivy.utils import platform
 
 import platform_utils
 
-from network import GameServer, GameClient, PORT
+from network import (
+    DISCOVERY_PORT,
+    DiscoveryResponder,
+    GameClient,
+    GameServer,
+    PORT,
+    discover_hosts,
+)
 
 from qr_join import (
     build_join_payload,
@@ -104,12 +112,25 @@ class CodenamesApp(App):
         self.host_poll_event = None
         self.client_poll_event = None
 
-        # Hosting metadata used by the join QR code.
+        # Hosting metadata used by LAN discovery and the QR fallback.
         self.host_port = PORT
         self.host_ip = "127.0.0.1"
+        self.host_ssid = ""
+        self.host_network_kind = "WI-FI"
         self.hotspot_ssid = ""
         self.hotspot_password = ""
         self.scanned_ssid = ""
+
+        # LAN discovery: host advertises, client scans.
+        self.discovery = None
+        self.discovery_error = None
+        self.host_network_event = None
+        self.lobby_scan_event = None
+        self.lobby_scan_thread = None
+        self.join_lobbies = []
+        self.lobby_list_box = None
+        self.lobby_status_label = None
+        self._last_scan_payload = None
 
         # Screen rebuilding is driven by orientation / size breakpoints.
         self._screen_builder = self.create_menu
@@ -224,6 +245,9 @@ class CodenamesApp(App):
         self._screen_builder = builder
         self._screen_name = name
         self._layout_signature_saved = self._layout_signature()
+
+        if name != "join":
+            self.stop_lobby_scan()
 
         root = getattr(self, "root", None)
 
@@ -1090,11 +1114,14 @@ class CodenamesApp(App):
             self.host_role = self.network_server.server.host_role
 
             # Port 0 (a busy 5000) is resolved by the OS; read it back so
-            # the QR code always contains the real port.
+            # discovery replies always contain the real port.
             self.host_port = (
                 self.network_server.server.server_address[1]
             )
             self.host_ip = platform_utils.get_host_ip()
+
+            self._refresh_host_network()
+            self._start_discovery()
 
         platform_utils.keep_screen_on()
 
@@ -1104,6 +1131,94 @@ class CodenamesApp(App):
             self.host_poll_event = Clock.schedule_interval(
                 self.update_host_lobby, 0.2
             )
+
+            # The network name can change while hosting (hotspot switched
+            # on mid-lobby), so keep the header fresh.
+            self.host_network_event = Clock.schedule_interval(
+                self._refresh_host_network, 4.0
+            )
+
+    # -----------------------------------------------------------------
+    # LAN DISCOVERY (HOST SIDE)
+    # -----------------------------------------------------------------
+
+    def _refresh_host_network(self, *args):
+        """Read the current Wi-Fi/hotspot name (main thread only)."""
+
+        kind, name = platform_utils.get_network_label()
+
+        self.host_network_kind = kind
+        self.host_ssid = name
+
+        label = getattr(self, "host_network_label", None)
+
+        if label is not None:
+            label.text = self._network_label_text()
+
+        return True
+
+    def _network_label_text(self):
+        kind = self.host_network_kind or "WI-FI"
+        name = self.host_ssid
+
+        if not name:
+            return f"{kind} · name hidden"
+
+        return f"{kind} · {name}"
+
+    def _discovery_info(self):
+        """Payload a probing client receives. Runs on the UDP thread."""
+
+        players = 1
+
+        server = self.network_server
+
+        if server is not None:
+
+            try:
+                players = len(server.server.get_lobby())
+            except Exception:
+                players = 1
+
+        return {
+            "host": self.host_ip,
+            "port": int(self.host_port or PORT),
+            "ssid": self.host_ssid,
+            "kind": self.host_network_kind,
+            "players": players,
+            "max": 8,
+        }
+
+    def _start_discovery(self):
+        self.discovery_error = None
+
+        self.discovery = DiscoveryResponder(self._discovery_info)
+
+        if self.discovery.start():
+            return
+
+        self.discovery_error = self.discovery.error
+        self.discovery = None
+
+    def _ask_for_network_permission(self):
+        """Android hides the SSID without the location permission."""
+
+        if platform != "android":
+            return
+
+        if getattr(self, "_asked_network_permission", False):
+            self._refresh_host_network()
+            return
+
+        self._asked_network_permission = True
+
+        granted = platform_utils.request_network_name_permission(
+            self._refresh_host_network
+        )
+
+        if granted:
+            self._refresh_host_network()
+
     # HOST LOBBY SCREEN
     def create_host_screen(self):
 
@@ -1157,6 +1272,48 @@ class CodenamesApp(App):
         root.add_widget(header)
 
         # ---------------------------------------------------------
+        # NETWORK BANNER (which Wi-Fi / hotspot the players share)
+        # ---------------------------------------------------------
+
+        network_row = Panel(
+            orientation="horizontal",
+            fill=SURFACE_HI,
+            border=BORDER_SOFT,
+            radius=RADIUS_SM,
+            padding=[
+                dp(12) if compact else dp(16),
+                dp(6),
+                dp(12) if compact else dp(16),
+                dp(6),
+            ],
+            spacing=dp(8),
+            size_hint=(1, None),
+            height=dp(34) if compact else dp(40),
+        )
+
+        network_row.add_widget(
+            self._label(
+                "ON THIS NETWORK",
+                dp(9) if compact else dp(10),
+                MUTED,
+                bold=True,
+                height=dp(12) if compact else dp(14),
+            )
+        )
+
+        self.host_network_label = self._label(
+            self._network_label_text(),
+            dp(12) if compact else dp(13),
+            ACCENT,
+            bold=True,
+            halign="right",
+            shorten=True,
+        )
+        network_row.add_widget(self.host_network_label)
+
+        root.add_widget(network_row)
+
+        # ---------------------------------------------------------
         # SERVER FAILED
         # ---------------------------------------------------------
 
@@ -1164,6 +1321,7 @@ class CodenamesApp(App):
 
             self.start_match_button = None
             self.host_qr_button = None
+            self.host_network_label.text = "SERVER OFFLINE"
 
             panel = Panel(
                 orientation="vertical",
@@ -1209,6 +1367,10 @@ class CodenamesApp(App):
         # LOBBY CONTENT
         # ---------------------------------------------------------
 
+        # Keep the banner truthful and ask Android for the SSID once.
+        self._refresh_host_network()
+        self._ask_for_network_permission()
+
         left = Panel(
             orientation="vertical",
             padding=[
@@ -1233,7 +1395,7 @@ class CodenamesApp(App):
             size_hint_x=0.9,
         )
 
-        # QR join block -------------------------------------------
+        # Join block ----------------------------------------------
 
         join_panel = Panel(
             orientation="vertical",
@@ -1243,7 +1405,7 @@ class CodenamesApp(App):
             padding=[dp(12), dp(10), dp(12), dp(10)],
             spacing=dp(5),
             size_hint=(1, None),
-            height=dp(124) if compact else dp(132),
+            height=dp(116) if compact else dp(124),
         )
 
         join_panel.add_widget(
@@ -1255,21 +1417,35 @@ class CodenamesApp(App):
                 height=dp(14),
             )
         )
+
+        join_hint = (
+            "Players on this Wi-Fi or hotspot see this lobby "
+            "and can join with one tap."
+        )
+
+        if self.discovery_error is not None:
+            join_hint = (
+                "Auto-discovery could not start. Use the QR code "
+                "instead."
+            )
+
         join_panel.add_widget(
             self._label(
-                "Scan the host's QR code from the app.",
-                dp(11),
-                TEXT,
-                height=dp(28),
+                join_hint,
+                dp(10) if compact else dp(11),
+                TEXT if self.discovery_error is None else RED,
+                height=dp(34),
             )
         )
 
+        # The QR code is the fallback for networks that block the UDP
+        # discovery broadcast (guest Wi-Fi with client isolation).
         self.host_qr_button = FlatButton(
             text="SHOW QR CODE",
-            variant="primary",
-            font_size=dp(12) if compact else dp(13),
+            variant="ghost",
+            font_size=dp(11) if compact else dp(12),
             size_hint=(1, None),
-            height=dp(40) if compact else dp(44),
+            height=dp(36) if compact else dp(40),
         )
         self.host_qr_button.bind(on_press=self.show_qr_modal)
         join_panel.add_widget(self.host_qr_button)
@@ -1429,7 +1605,7 @@ class CodenamesApp(App):
         content = self._two_panel_content(
             left,
             right,
-            left_height=dp(316) if compact else dp(340),
+            left_height=dp(308) if compact else dp(332),
             right_height=dp(390) if compact else dp(420),
         )
 
@@ -1501,7 +1677,7 @@ class CodenamesApp(App):
             orientation="vertical",
             size_hint=(None, None),
             width=self._clamp_width(dp(356)),
-            height=qr_side + dp(368),
+            height=qr_side + dp(396),
             padding=[dp(22), dp(18), dp(22), dp(18)],
             spacing=dp(7),
         )
@@ -1524,6 +1700,16 @@ class CodenamesApp(App):
                 bold=True,
                 halign="center",
                 height=dp(32),
+            )
+        )
+
+        panel.add_widget(
+            self._label(
+                "Fallback only: use this when the lobby list is empty.",
+                dp(9) if compact else dp(10),
+                MUTED,
+                halign="center",
+                height=dp(26),
             )
         )
 
@@ -1562,7 +1748,7 @@ class CodenamesApp(App):
         )
 
         self.qr_ssid_input = FlatInput(
-            text=self.hotspot_ssid,
+            text=self.hotspot_ssid or self.host_ssid,
             hint_text="Hotspot name (optional)",
             height=dp(40),
         )
@@ -1953,8 +2139,10 @@ class CodenamesApp(App):
 
         self.cleanup_network()
         self._manual_join_open = False
+        self.join_lobbies = []
 
         self.show_screen(self.create_join_screen, "join")
+
     # JOIN SCREEN
     def create_join_screen(self):
 
@@ -1963,10 +2151,11 @@ class CodenamesApp(App):
 
         root = ScreenRoot()
 
+        # The desktop fallback adds the manual address block below.
         base_height = (
-            dp(452 if android else 470)
+            dp(556 if android else 690)
             if compact
-            else dp(486 if android else 500)
+            else dp(596 if android else 726)
         )
 
         card = Panel(
@@ -2003,16 +2192,11 @@ class CodenamesApp(App):
         )
 
         subtitle = self._label(
-            (
-                "Scan the host's QR code to join.\n"
-                "Same Wi-Fi or hotspot required."
-                if android
-                else "Enter the host address, or scan the QR\n"
-                "code with a phone running the app."
-            ),
+            "Pick a host on this network.\n"
+            "Same Wi-Fi or hotspot required.",
             dp(11) if compact else dp(12),
             MUTED,
-            height=dp(38) if compact else dp(34),
+            height=dp(36),
         )
         subtitle.bind(
             width=lambda instance, width: setattr(
@@ -2026,7 +2210,7 @@ class CodenamesApp(App):
         card.add_widget(
             Widget(
                 size_hint_y=None,
-                height=dp(4) if compact else dp(6),
+                height=dp(2) if compact else dp(4),
             )
         )
 
@@ -2046,20 +2230,9 @@ class CodenamesApp(App):
         )
         card.add_widget(self.join_name_input)
 
-        # Manual address is the desktop fallback. On Android it lives
-        # behind an explicit toggle so the normal flow is scan-only.
-        self.manual_join_box = BoxLayout(
-            orientation="vertical",
-            size_hint=(1, None),
-            height=0,
-            spacing=dp(2),
-            opacity=0,
-            disabled=True,
-        )
-
-        self.manual_join_box.add_widget(
+        card.add_widget(
             self._label(
-                "HOST ADDRESS",
+                "LOBBIES ON THIS NETWORK",
                 dp(10),
                 MUTED,
                 bold=True,
@@ -2067,173 +2240,333 @@ class CodenamesApp(App):
             )
         )
 
-        self.join_ip_input = FlatInput(
-            text="" if android else "127.0.0.1:5000",
-            hint_text="192.168.1.5:5000",
+        # Each discovered host becomes one row inside this scroll view.
+        self.lobby_list_box = BoxLayout(
+            orientation="vertical",
+            size_hint=(1, None),
+            spacing=dp(6),
+        )
+        self.lobby_list_box.bind(
+            minimum_height=self.lobby_list_box.setter("height")
+        )
+
+        self.lobby_scroll = ScrollView(
+            do_scroll_x=False,
+            bar_width=dp(3),
+            size_hint=(1, None),
+            height=dp(140) if compact else dp(156),
+        )
+        self.lobby_scroll.add_widget(self.lobby_list_box)
+        card.add_widget(self.lobby_scroll)
+
+        self._render_lobbies(self.join_lobbies)
+
+        action_row = BoxLayout(
+            orientation="horizontal",
+            size_hint=(1, None),
             height=dp(42) if compact else dp(46),
+            spacing=dp(8),
         )
 
-        manual_label = self._label(
-            "ADVANCED: ENTER ADDRESS",
-            dp(10),
+        refresh_button = FlatButton(
+            text="SEARCH AGAIN",
+            variant="default",
+            font_size=dp(11) if compact else dp(12),
+            size_hint=(1, 1),
+        )
+        refresh_button.bind(on_press=self.refresh_lobbies_now)
+
+        scan_button = FlatButton(
+            text="SCAN QR",
+            variant="ghost",
+            font_size=dp(11) if compact else dp(12),
+            size_hint=(1, 1),
+        )
+        scan_button.bind(on_press=self.scan_to_join)
+
+        action_row.add_widget(refresh_button)
+        action_row.add_widget(scan_button)
+        card.add_widget(action_row)
+
+        self.join_status_label = self._label(
+            "Searching for hosts on this network...",
+            dp(10) if compact else dp(11),
             MUTED,
-            bold=True,
             halign="center",
-            height=dp(14),
+            height=dp(34),
         )
-
-        if android:
-            card.add_widget(manual_label)
-            card.add_widget(self.manual_join_box)
-            self._manual_join_label = manual_label
-            manual_label.height = 0
-            manual_label.opacity = 0
-
-            self.manual_join_box.add_widget(self.join_ip_input)
-
-            manual_connect = FlatButton(
-                text="CONNECT",
-                variant="default",
-                font_size=dp(12),
-                size_hint=(1, None),
-                height=dp(40),
-            )
-            manual_connect.bind(on_press=self.connect_to_host)
-            self.manual_join_box.add_widget(manual_connect)
-            self.manual_join_box.height = 0
-
-            scan_button = FlatButton(
-                text="SCAN QR CODE",
-                variant="primary",
-                font_size=dp(14) if compact else dp(15),
-                size_hint=(1, None),
-                height=dp(48) if compact else dp(52),
-            )
-            scan_button.bind(on_press=self.scan_to_join)
-            card.add_widget(scan_button)
-
-            manual_button = FlatButton(
-                text="ENTER ADDRESS MANUALLY",
-                variant="ghost",
-                font_size=dp(11) if compact else dp(12),
-                size_hint=(1, None),
-                height=dp(40),
-            )
-            manual_button.bind(on_press=self.toggle_manual_join)
-            self._manual_join_button = manual_button
-            card.add_widget(manual_button)
-
-            self.join_status_label = self._label(
-                "Tap SCAN QR CODE and point the camera at the host.",
-                dp(11) if compact else dp(12),
-                MUTED,
-                halign="center",
-                height=dp(38),
-            )
-
-            back_button = FlatButton(
-                text="BACK TO MENU",
-                variant="ghost",
-                font_size=dp(11) if compact else dp(12),
-                size_hint=(1, None),
-                height=dp(40),
-            )
-            back_button.bind(on_press=self.return_to_menu)
-
-            card.add_widget(self.join_status_label)
-            card.add_widget(back_button)
-
-        else:
-            card.add_widget(
-                self._label(
-                    "HOST ADDRESS",
-                    dp(10),
-                    MUTED,
-                    bold=True,
-                    height=dp(14),
-                )
-            )
-            card.add_widget(self.join_ip_input)
-
-            join_button = FlatButton(
-                text="CONNECT",
-                variant="primary",
-                font_size=dp(14) if compact else dp(15),
-                size_hint=(1, None),
-                height=dp(48) if compact else dp(50),
-            )
-            join_button.bind(on_press=self.connect_to_host)
-            card.add_widget(join_button)
-
-            self.join_status_label = self._label(
-                "Enter the host address to connect.",
-                dp(11) if compact else dp(12),
-                MUTED,
-                halign="center",
-                height=dp(36),
-            )
-            card.add_widget(self.join_status_label)
-
-            back_button = FlatButton(
-                text="BACK TO MENU",
-                variant="ghost",
-                font_size=dp(11) if compact else dp(12),
-                size_hint=(1, None),
-                height=dp(40),
-            )
-            back_button.bind(on_press=self.return_to_menu)
-            card.add_widget(back_button)
-
         self.join_status_label.bind(
             width=lambda instance, width: setattr(
                 instance, "text_size", (width, None)
             )
         )
 
+        # Discovery and the connect flow share one status line.
+        self.lobby_status_label = self.join_status_label
+
+        card.add_widget(self.join_status_label)
+
+        if not android:
+
+            # Desktop regression path: two windows on one PC can always
+            # be linked explicitly, even when discovery is filtered.
+            card.add_widget(
+                self._label(
+                    "HOST ADDRESS (DESKTOP TEST)",
+                    dp(10),
+                    MUTED,
+                    bold=True,
+                    height=dp(14),
+                )
+            )
+
+            self.join_ip_input = FlatInput(
+                text="127.0.0.1:5000",
+                hint_text="192.168.1.5:5000",
+                height=dp(42) if compact else dp(46),
+            )
+            card.add_widget(self.join_ip_input)
+
+            connect_button = FlatButton(
+                text="CONNECT",
+                variant="default",
+                font_size=dp(12),
+                size_hint=(1, None),
+                height=dp(42),
+            )
+            connect_button.bind(on_press=self.connect_to_host)
+            card.add_widget(connect_button)
+
+        else:
+
+            self.join_ip_input = None
+
+        back_button = FlatButton(
+            text="BACK TO MENU",
+            variant="ghost",
+            font_size=dp(11) if compact else dp(12),
+            size_hint=(1, None),
+            height=dp(40),
+        )
+        back_button.bind(on_press=self.return_to_menu)
+        card.add_widget(back_button)
+
         root.add_widget(self._centered_scroll(card))
 
-        # Orientation changes rebuild the screen, so restore the manual
-        # address section if the player had it open.
-        if android:
-            self._apply_manual_join_state()
+        # Start (or resume) discovery. This also runs after a rotation
+        # rebuilds the screen.
+        self.start_lobby_scan()
 
         return root
 
-    def toggle_manual_join(self, instance=None):
-        self._manual_join_open = not self._manual_join_open
-        self._apply_manual_join_state()
+    # -----------------------------------------------------------------
+    # LAN DISCOVERY (CLIENT SIDE)
+    # -----------------------------------------------------------------
 
-    def _apply_manual_join_state(self):
-        if not hasattr(self, "manual_join_box"):
+    def start_lobby_scan(self):
+
+        if self._screen_name != "join":
             return
 
-        opened = self._manual_join_open
+        self.stop_lobby_scan()
 
-        self.manual_join_box.height = (
-            dp(108) if opened else 0
-        )
-        self.manual_join_box.opacity = 1 if opened else 0
-        self.manual_join_box.disabled = not opened
-        self.join_ip_input.disabled = not opened
-        self._manual_join_label.height = dp(14) if opened else 0
-        self._manual_join_label.opacity = 1 if opened else 0
-
-        self.join_card.height = self._join_base_height + (
-            dp(130) if opened else 0
+        self.lobby_scan_event = Clock.schedule_interval(
+            self.refresh_lobbies, 3.0
         )
 
-        if opened:
-            self._manual_join_button.text = "HIDE MANUAL ADDRESS"
-            self.join_status_label.text = (
-                "Type the host address shown on the desktop lobby."
+        Clock.schedule_once(self.refresh_lobbies, 0)
+
+    def stop_lobby_scan(self):
+
+        if self.lobby_scan_event is not None:
+            self.lobby_scan_event.cancel()
+            self.lobby_scan_event = None
+
+    def refresh_lobbies_now(self, instance=None):
+
+        Clock.schedule_once(self.refresh_lobbies, 0)
+
+    def refresh_lobbies(self, dt=0):
+
+        if self._screen_name != "join":
+            return False
+
+        # Never stack scans: one probe round at a time.
+        if (
+            self.lobby_scan_thread is not None
+            and self.lobby_scan_thread.is_alive()
+        ):
+            return True
+
+        if (
+            self.lobby_status_label is not None
+            and self.network_client is None
+            and not self.join_lobbies
+        ):
+            self.lobby_status_label.text = (
+                "Searching for hosts on this network..."
             )
+
+        thread = threading.Thread(
+            target=self._lobby_scan_worker,
+            daemon=True
+        )
+        self.lobby_scan_thread = thread
+        thread.start()
+
+        return True
+
+    def _lobby_scan_worker(self):
+
+        try:
+            hosts = discover_hosts(timeout=1.6)
+
+        except Exception:
+            hosts = []
+
+        Clock.schedule_once(
+            lambda dt: self._apply_lobby_results(hosts),
+            0,
+        )
+
+    def _apply_lobby_results(self, hosts):
+
+        if self._screen_name != "join":
+            return
+
+        self.join_lobbies = list(hosts or [])
+        self._render_lobbies(self.join_lobbies)
+
+        if self.lobby_status_label is None:
+            return
+
+        if self.network_client is not None:
+            return
+
+        count = len(self.join_lobbies)
+
+        if count == 0:
+            self.lobby_status_label.text = (
+                "No host yet. Both phones must be on the same "
+                "Wi-Fi or hotspot."
+            )
+        elif count == 1:
+            self.lobby_status_label.text = "1 host found. Tap JOIN."
         else:
-            self._manual_join_button.text = "ENTER ADDRESS MANUALLY"
-            self.join_status_label.text = (
-                "Tap SCAN QR CODE and point the camera at the host."
+            self.lobby_status_label.text = (
+                f"{count} hosts found. Tap JOIN."
             )
 
-    # CONNECT: SCAN OR MANUAL
+    def _render_lobbies(self, hosts):
+
+        box = self.lobby_list_box
+
+        if box is None:
+            return
+
+        compact = self._is_compact()
+
+        box.clear_widgets()
+
+        if not hosts:
+
+            box.add_widget(
+                self._label(
+                    "No host found yet.\n"
+                    "Both phones must share the same Wi-Fi or hotspot.",
+                    dp(10) if compact else dp(11),
+                    MUTED,
+                    halign="center",
+                    height=dp(52),
+                )
+            )
+
+            return
+
+        for host in hosts:
+            box.add_widget(self._lobby_row(host))
+
+    def _lobby_row(self, host):
+
+        compact = self._is_compact()
+
+        row = Panel(
+            orientation="horizontal",
+            fill=SURFACE_HI,
+            border=BORDER_SOFT,
+            radius=RADIUS_SM,
+            padding=[dp(10), dp(6), dp(8), dp(6)],
+            spacing=dp(8),
+            size_hint=(1, None),
+            height=dp(50) if compact else dp(54),
+        )
+
+        labels = BoxLayout(orientation="vertical", spacing=0)
+
+        labels.add_widget(
+            self._label(
+                host.get("ssid") or "Codenames host",
+                dp(12) if compact else dp(13),
+                TEXT,
+                bold=True,
+                height=dp(18),
+                shorten=True,
+            )
+        )
+
+        players = int(host.get("players") or 1)
+        kind = str(host.get("kind") or "WI-FI")
+
+        labels.add_widget(
+            self._label(
+                f"{players} player{'s' if players != 1 else ''} · {kind}",
+                dp(9) if compact else dp(10),
+                MUTED,
+                height=dp(14),
+            )
+        )
+
+        join_button = FlatButton(
+            text="JOIN",
+            variant="primary",
+            font_size=dp(11) if compact else dp(12),
+            size_hint=(None, 1),
+            width=dp(64) if compact else dp(74),
+        )
+        join_button.bind(
+            on_press=lambda instance, entry=dict(host): (
+                self.join_discovered_host(entry)
+            )
+        )
+
+        row.add_widget(labels)
+        row.add_widget(join_button)
+
+        return row
+
+    def join_discovered_host(self, host):
+
+        if not host:
+            return
+
+        name = (
+            self.join_name_input.text.strip() or "Player"
+        )[:20]
+
+        port = host.get("port")
+
+        try:
+            port = int(port)
+
+        except (TypeError, ValueError):
+            port = PORT
+
+        self.client_name = name
+        self.scanned_ssid = str(host.get("ssid") or "")
+
+        self._connect_to_host(host.get("host"), port, name)
+
+    # CONNECT: DISCOVERY, QR OR MANUAL
     def scan_to_join(self, instance=None):
         if not is_scan_supported():
             self.join_status_label.text = (
@@ -2243,12 +2576,110 @@ class CodenamesApp(App):
 
         self.join_status_label.text = "Opening the camera..."
 
-        started = scan_qr_code(self._handle_scan_result)
+        started = scan_qr_code(
+            self._handle_scan_result,
+            self._handle_scan_error,
+        )
 
         if not started:
             self.join_status_label.text = (
-                "Could not open the camera. Enter the address manually."
+                "Could not open the camera. Pick a lobby above, or "
+                "allow the camera in Settings."
             )
+
+    def _handle_scan_error(self, reason):
+        label = getattr(self, "join_status_label", None)
+
+        if reason == "permission":
+
+            if label is not None:
+                label.text = (
+                    "Camera permission is blocked. Allow it in "
+                    "Settings, then scan again."
+                )
+
+            self.show_camera_help()
+
+            return
+
+        if label is not None:
+            label.text = (
+                "The QR scanner could not start on this phone."
+            )
+
+    def show_camera_help(self):
+        """Explain how to re-enable the camera after a denial."""
+
+        panel = Panel(
+            orientation="vertical",
+            size_hint=(None, None),
+            width=self._clamp_width(dp(330)),
+            height=dp(268),
+            padding=[dp(20), dp(18), dp(20), dp(18)],
+            spacing=dp(10),
+        )
+
+        panel.add_widget(
+            self._label(
+                "CAMERA BLOCKED",
+                dp(10),
+                RED,
+                bold=True,
+                halign="center",
+                height=dp(14),
+            )
+        )
+        panel.add_widget(
+            self._label(
+                "The QR scanner needs the camera permission.",
+                dp(12),
+                TEXT,
+                halign="center",
+                height=dp(40),
+            )
+        )
+        panel.add_widget(
+            self._label(
+                "Settings > Apps > Codenames > Permissions > Camera",
+                dp(10),
+                MUTED,
+                halign="center",
+                height=dp(48),
+            )
+        )
+
+        row = BoxLayout(
+            orientation="horizontal",
+            size_hint=(1, None),
+            height=dp(44),
+            spacing=dp(8),
+        )
+
+        settings_button = FlatButton(
+            text="OPEN SETTINGS",
+            variant="primary",
+            font_size=dp(11),
+            size_hint=(1, 1),
+        )
+        settings_button.bind(
+            on_press=lambda instance: (
+                platform_utils.open_app_settings()
+            )
+        )
+
+        close_button = FlatButton(
+            text="CLOSE",
+            variant="ghost",
+            font_size=dp(11),
+            size_hint=(1, 1),
+        )
+        close_button.bind(on_press=self._close_overlay)
+
+        row.add_widget(settings_button)
+        row.add_widget(close_button)
+        panel.add_widget(row)
+
+        self._open_overlay(panel)
 
     def _handle_scan_result(self, data):
         if not data:
@@ -2263,12 +2694,15 @@ class CodenamesApp(App):
             )
             return
 
+        self._last_scan_payload = payload
         self.scanned_ssid = payload.get("ssid", "")
 
         name = (
             self.join_name_input.text.strip() or "Player"
         )[:20]
         self.client_name = name
+
+        self.join_status_label.text = "QR read. Connecting..."
 
         self._connect_to_host(
             payload["host"],
@@ -2277,6 +2711,11 @@ class CodenamesApp(App):
         )
 
     def connect_to_host(self, instance=None):
+        """Desktop-only manual address fallback."""
+
+        if self.join_ip_input is None:
+            return
+
         raw = self.join_ip_input.text.strip()
 
         player_name = (
@@ -2307,6 +2746,8 @@ class CodenamesApp(App):
         )
 
     def _connect_to_host(self, host, port, player_name):
+        self.stop_lobby_scan()
+
         self.network_client = GameClient()
 
         self.join_status_label.text = "Connecting..."
@@ -2988,14 +3429,15 @@ class CodenamesApp(App):
 
                 if getattr(self, "scanned_ssid", ""):
                     message += (
-                        f"\nConnect to the '{self.scanned_ssid}' "
-                        f"Wi-Fi/hotspot first."
+                        f"\nConnect this phone to the "
+                        f"'{self.scanned_ssid}' Wi-Fi/hotspot, "
+                        f"then try again."
                     )
 
                 if hasattr(self, "join_status_label"):
 
                     self.join_status_label.text = (
-                        f"CONNECTION FAILED:\n{message}"
+                        f"COULD NOT CONNECT:\n{message}"
                     )
 
                 if hasattr(self, "client_info_label"):
@@ -3003,6 +3445,11 @@ class CodenamesApp(App):
                     self.client_info_label.text = (
                         f"Connection error: {message}"
                     )
+
+                # Back on the join screen: keep looking so the player
+                # can tap a different host.
+                if self._screen_name == "join":
+                    self.start_lobby_scan()
 
             # DISCONNECTED
             elif event_type == "disconnected":
@@ -3023,6 +3470,9 @@ class CodenamesApp(App):
                     self.join_status_label.text = (
                         "Disconnected from host."
                     )
+
+                if self._screen_name == "join":
+                    self.start_lobby_scan()
             elif event_type == "lobby_update":
 
                 self.client_lobby = event.get(
@@ -3155,6 +3605,16 @@ class CodenamesApp(App):
         if self.client_poll_event:
             self.client_poll_event.cancel()
             self.client_poll_event = None
+
+        if self.host_network_event:
+            self.host_network_event.cancel()
+            self.host_network_event = None
+
+        self.stop_lobby_scan()
+
+        if self.discovery:
+            self.discovery.stop()
+            self.discovery = None
 
         if self.network_client:
 

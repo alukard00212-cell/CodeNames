@@ -38,13 +38,16 @@ android.archs = arm64-v8a, armeabi-v7a
 android.gradle_dependencies = com.journeyapps:zxing-android-embedded:4.3.0
 android.enable_androidx = True
 
-android.permissions = INTERNET,CAMERA,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,WAKE_LOCK
+android.permissions = INTERNET,CAMERA,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,WAKE_LOCK,ACCESS_FINE_LOCATION,NEARBY_WIFI_DEVICES
 
 android.accept_sdk_license = True
 
 # The app never creates a hotspot or joins Wi-Fi networks itself; players
 # use the phone's system hotspot / Wi-Fi. INTERNET is enough for the game
-# socket, CAMERA is for the in-app QR scanner.
+# socket, CAMERA is for the in-app QR scanner (fallback path), and
+# ACCESS_FINE_LOCATION / NEARBY_WIFI_DEVICES let the lobby show the name
+# of the Wi-Fi network or shared hotspot (Android hides the SSID
+# otherwise).
 
 [buildozer]
 

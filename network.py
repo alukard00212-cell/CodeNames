@@ -4,9 +4,19 @@ import queue
 import socket
 import socketserver
 import threading
+import time
 
 
 PORT = 5000
+
+# LAN discovery runs on its own UDP port so it never collides with the
+# TCP game socket. A host answers probes from any client on the same
+# network; the reply carries the real TCP port and the network name.
+DISCOVERY_PORT = 5001
+
+DISCOVERY_PROBE = b"CODENAMES_DISCOVER_V1"
+
+DISCOVERY_REPLY = b"CODENAMES_HOST_V1 "
 
 # Hosts are not connected TCP clients, so they use a reserved key.
 HOST_KEY = "__host__"
@@ -663,3 +673,301 @@ def get_local_ip():
     finally:
 
         connection.close()
+
+
+# =========================================================
+# LAN DISCOVERY
+# =========================================================
+
+def _local_addresses():
+    """Every plausible IPv4 address of this device (no Kivy import)."""
+
+    addresses = []
+
+    for destination in ("192.0.2.1", "8.8.8.8"):
+
+        probe = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_DGRAM
+        )
+
+        try:
+
+            probe.settimeout(0.2)
+            probe.connect((destination, 80))
+            address = probe.getsockname()[0]
+
+        except OSError:
+
+            address = None
+
+        finally:
+
+            probe.close()
+
+        if address and address != "127.0.0.1":
+            if address not in addresses:
+                addresses.append(address)
+
+    return addresses
+
+
+def _broadcast_targets():
+    """Broadcast addresses worth probing, plus loopback for tests."""
+
+    targets = ["255.255.255.255", "127.0.0.1"]
+
+    for address in _local_addresses():
+
+        octets = address.split(".")
+
+        if len(octets) != 4:
+            continue
+
+        subnet = ".".join(octets[:3] + ["255"])
+
+        if subnet not in targets:
+            targets.append(subnet)
+
+    return targets
+
+
+class DiscoveryResponder:
+    """Answer UDP probes from clients looking for a host on the LAN."""
+
+    def __init__(self, info_provider, port=DISCOVERY_PORT):
+
+        # `info_provider` runs on the responder thread; it must not touch
+        # the UI. Returning a plain dict is enough.
+        self.info_provider = info_provider
+        self.port = port
+
+        self.sock = None
+        self.thread = None
+        self.error = None
+
+    def start(self):
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        try:
+
+            sock.bind(("", self.port))
+
+        except OSError as error:
+
+            self.error = error
+
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+            return False
+
+        sock.settimeout(0.8)
+
+        self.sock = sock
+        self.thread = threading.Thread(
+            target=self._serve,
+            daemon=True
+        )
+        self.thread.start()
+
+        return True
+
+    def _serve(self):
+
+        while True:
+
+            sock = self.sock
+
+            if sock is None:
+                return
+
+            try:
+
+                data, address = sock.recvfrom(1024)
+
+            except socket.timeout:
+
+                continue
+
+            except OSError:
+
+                return
+
+            if data.strip() != DISCOVERY_PROBE:
+                continue
+
+            try:
+
+                info = dict(self.info_provider() or {})
+
+            except Exception:
+
+                info = {}
+
+            info["app"] = "codenames"
+            info["v"] = 1
+
+            try:
+
+                payload = DISCOVERY_REPLY + json.dumps(info).encode(
+                    "utf-8"
+                )
+
+                sock.sendto(payload, address)
+
+            except (OSError, TypeError, ValueError):
+
+                pass
+
+    def stop(self):
+
+        sock = self.sock
+        self.sock = None
+
+        if sock is None:
+            return
+
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+        if self.thread is not None:
+
+            try:
+                self.thread.join(timeout=1)
+            except RuntimeError:
+                pass
+
+            self.thread = None
+
+
+def _parse_discovery_reply(data, address):
+    """Turn a host reply into a dict, or None when it is not ours."""
+
+    if not data.startswith(DISCOVERY_REPLY):
+        return None
+
+    try:
+
+        info = json.loads(
+            data[len(DISCOVERY_REPLY):].decode("utf-8")
+        )
+
+    except (json.JSONDecodeError, UnicodeDecodeError):
+
+        return None
+
+    if not isinstance(info, dict):
+        return None
+
+    if info.get("app") != "codenames":
+        return None
+
+    host = str(info.get("host") or address[0]).strip()
+
+    if not host:
+        return None
+
+    try:
+
+        port = int(info.get("port") or PORT)
+
+    except (TypeError, ValueError):
+
+        return None
+
+    if not 0 < port < 65536:
+        return None
+
+    try:
+
+        players = int(info.get("players") or 1)
+
+    except (TypeError, ValueError):
+
+        players = 1
+
+    return {
+        "host": host,
+        "port": port,
+        "ssid": str(info.get("ssid") or "").strip(),
+        "kind": str(info.get("kind") or "WI-FI").strip() or "WI-FI",
+        "players": max(1, players),
+        "max": int(info.get("max") or 8),
+        "source": address[0],
+    }
+
+
+def discover_hosts(timeout=1.8, port=DISCOVERY_PORT):
+    """Ask the LAN for Codenames hosts and collect the replies.
+
+    This blocks for at most `timeout` seconds, so callers should run it on
+    a worker thread. Returns a list of dicts, deduplicated per endpoint.
+    """
+
+    found = {}
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    try:
+
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", 0))
+        sock.settimeout(0.25)
+
+        for target in _broadcast_targets():
+
+            try:
+
+                sock.sendto(DISCOVERY_PROBE, (target, port))
+
+            except OSError:
+
+                continue
+
+        deadline = time.monotonic() + max(0.2, float(timeout))
+
+        while time.monotonic() < deadline:
+
+            try:
+
+                data, address = sock.recvfrom(2048)
+
+            except socket.timeout:
+
+                continue
+
+            except OSError:
+
+                break
+
+            info = _parse_discovery_reply(data, address)
+
+            if info is None:
+                continue
+
+            found[(info["host"], info["port"])] = info
+
+    except OSError:
+
+        pass
+
+    finally:
+
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    return sorted(
+        found.values(),
+        key=lambda item: (-item["players"], item["ssid"].lower())
+    )

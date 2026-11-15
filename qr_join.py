@@ -247,15 +247,111 @@ class _Scanner:
 
     def __init__(self):
         self._callback = None
+        self._error_callback = None
         self._bound = False
         self._integrator = None
 
-    def start(self, callback):
-        """Open the Android QR scanner. Returns False when unavailable."""
+        # Set while the CAMERA permission dialog is open.
+        self._pending_callback = None
+        self._pending_error = None
+
+    def start(self, callback, on_error=None):
+        """Open the Android QR scanner. Returns False when unavailable.
+
+        `callback(text_or_None)` receives the scanned text. `on_error` is
+        called with "permission" when the camera permission was denied and
+        with "unsupported" when the scanner cannot run at all.
+        """
 
         if not is_scan_supported():
+            self._fail(on_error, "unsupported")
             return False
 
+        granted = self._camera_granted()
+
+        if granted is False:
+
+            self._pending_callback = callback
+            self._pending_error = on_error
+
+            try:
+                from android.permissions import (
+                    Permission,
+                    request_permissions,
+                )
+
+                request_permissions(
+                    [Permission.CAMERA],
+                    self._on_permission_result
+                )
+
+                return True
+
+            except Exception:
+
+                self._pending_callback = None
+                self._pending_error = None
+
+                self._fail(on_error, "permission")
+
+                return False
+
+        if granted is None:
+            # pyjnius/permissions module missing: try the scanner anyway,
+            # ZXing shows its own error if the camera is unavailable.
+            return self._launch(callback, on_error)
+
+        return self._launch(callback, on_error)
+
+    def _camera_granted(self):
+        """True/False when we can tell, None when the API is unavailable."""
+
+        try:
+            from android.permissions import (
+                Permission,
+                check_permission,
+            )
+
+            return bool(check_permission(Permission.CAMERA))
+
+        except Exception:
+            return None
+
+    def _on_permission_result(self, *args):
+        """Runtime permission callback: (permissions, grants)."""
+
+        granted = False
+
+        for argument in args:
+
+            if (
+                isinstance(argument, (list, tuple))
+                and argument
+                and isinstance(argument[0], bool)
+            ):
+                granted = all(argument)
+
+        callback = self._pending_callback
+        on_error = self._pending_error
+
+        self._pending_callback = None
+        self._pending_error = None
+
+        if granted:
+
+            Clock.schedule_once(
+                lambda dt: self._launch(callback, on_error),
+                0,
+            )
+
+        else:
+
+            Clock.schedule_once(
+                lambda dt: self._fail(on_error, "permission"),
+                0,
+            )
+
+    def _launch(self, callback, on_error=None):
         try:
             from android import activity, mActivity
             from jnius import autoclass
@@ -270,7 +366,15 @@ class _Scanner:
             integrator.setOrientationLocked(False)
             integrator.setRequestCode(SCAN_REQUEST_CODE)
 
+            # A Codenames invite is always a QR code; scanning only that
+            # format is faster and avoids random barcode noise.
+            try:
+                integrator.setDesiredBarcodeFormats(["QR_CODE"])
+            except Exception:
+                pass
+
             self._callback = callback
+            self._error_callback = on_error
             self._integrator = integrator
 
             if not self._bound:
@@ -284,11 +388,24 @@ class _Scanner:
             return True
 
         except Exception:
+
             self._callback = None
+            self._error_callback = None
             self._integrator = None
+
             self._unbind()
+            self._fail(on_error, "unsupported")
 
             return False
+
+    def _fail(self, on_error, reason):
+        if on_error is None:
+            return
+
+        try:
+            on_error(reason)
+        except Exception:
+            pass
 
     def _unbind(self):
         if not self._bound:
@@ -319,6 +436,7 @@ class _Scanner:
 
         callback = self._callback
         self._callback = None
+        self._error_callback = None
         self._integrator = None
         self._unbind()
 
@@ -334,7 +452,7 @@ class _Scanner:
 _scanner = _Scanner()
 
 
-def scan_qr_code(callback):
+def scan_qr_code(callback, on_error=None):
     """Start the scanner and call `callback(text_or_None)` with the result."""
 
-    return _scanner.start(callback)
+    return _scanner.start(callback, on_error)
