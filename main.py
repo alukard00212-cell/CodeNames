@@ -132,6 +132,9 @@ class CodenamesApp(App):
         self.lobby_status_label = None
         self._last_scan_payload = None
 
+        # Shown above the lobby list after a failed/lost connection.
+        self._join_notice = None
+
         # Screen rebuilding is driven by orientation / size breakpoints.
         self._screen_builder = self.create_menu
         self._screen_name = "menu"
@@ -2143,6 +2146,12 @@ class CodenamesApp(App):
 
         self.show_screen(self.create_join_screen, "join")
 
+    def _return_to_join(self, notice):
+        """Bounce back to the lobby list after losing the host."""
+
+        self._join_notice = notice
+        self.show_join_screen(None)
+
     # JOIN SCREEN
     def create_join_screen(self):
 
@@ -2289,9 +2298,10 @@ class CodenamesApp(App):
         card.add_widget(action_row)
 
         self.join_status_label = self._label(
-            "Searching for hosts on this network...",
+            self._join_notice
+            or "Searching for hosts on this network...",
             dp(10) if compact else dp(11),
-            MUTED,
+            MUTED if self._join_notice is None else RED,
             halign="center",
             height=dp(34),
         )
@@ -2402,6 +2412,7 @@ class CodenamesApp(App):
             self.lobby_status_label is not None
             and self.network_client is None
             and not self.join_lobbies
+            and self._join_notice is None
         ):
             self.lobby_status_label.text = (
                 "Searching for hosts on this network..."
@@ -2442,6 +2453,8 @@ class CodenamesApp(App):
 
         if self.network_client is not None:
             return
+
+        self._join_notice = None
 
         count = len(self.join_lobbies)
 
@@ -2745,8 +2758,31 @@ class CodenamesApp(App):
             player_name,
         )
 
+    def _drop_client(self):
+        """Close the client socket and stop polling it (safe to repeat)."""
+
+        poll = getattr(self, "client_poll_event", None)
+
+        if poll is not None:
+            poll.cancel()
+            self.client_poll_event = None
+
+        client = self.network_client
+
+        if client is None:
+            return
+
+        self.network_client = None
+
+        try:
+            client.close()
+
+        except Exception:
+            pass
+
     def _connect_to_host(self, host, port, player_name):
         self.stop_lobby_scan()
+        self._drop_client()
 
         self.network_client = GameClient()
 
@@ -3083,6 +3119,10 @@ class CodenamesApp(App):
         if card.card_index in self.client_revealed:
             return
 
+        if self.network_client is None:
+            self.client_info_label.text = "No connection to the host."
+            return
+
         success = self.network_client.send_message({
             "type": "reveal_card",
             "index": card.card_index
@@ -3111,6 +3151,10 @@ class CodenamesApp(App):
             return
 
         if self.client_selection_pending:
+            return
+
+        if self.network_client is None:
+            self.client_info_label.text = "No connection to the host."
             return
 
         success = self.network_client.send_message({
@@ -3446,18 +3490,24 @@ class CodenamesApp(App):
                         f"Connection error: {message}"
                     )
 
+                # The connection is dead: drop the client so the next
+                # JOIN starts clean and discovery can report again.
+                self.client_selection_pending = False
+                self._drop_client()
+
                 # Back on the join screen: keep looking so the player
                 # can tap a different host.
                 if self._screen_name == "join":
                     self.start_lobby_scan()
+                elif self._screen_name not in ("menu", "game"):
+                    self._return_to_join("Connection lost.")
 
             # DISCONNECTED
             elif event_type == "disconnected":
 
                 self.client_selection_pending = False
 
-                if self.network_client:
-                    self.network_client.close()
+                self._drop_client()
 
                 if hasattr(self, "client_info_label"):
 
@@ -3465,7 +3515,10 @@ class CodenamesApp(App):
                         "Disconnected from host."
                     )
 
-                elif hasattr(self, "join_status_label"):
+                elif (
+                    hasattr(self, "join_status_label")
+                    and self._join_notice is None
+                ):
 
                     self.join_status_label.text = (
                         "Disconnected from host."
@@ -3473,6 +3526,8 @@ class CodenamesApp(App):
 
                 if self._screen_name == "join":
                     self.start_lobby_scan()
+                elif self._screen_name not in ("menu", "game"):
+                    self._return_to_join("The host closed the lobby.")
             elif event_type == "lobby_update":
 
                 self.client_lobby = event.get(
@@ -3602,10 +3657,6 @@ class CodenamesApp(App):
             self.host_poll_event.cancel()
             self.host_poll_event = None
 
-        if self.client_poll_event:
-            self.client_poll_event.cancel()
-            self.client_poll_event = None
-
         if self.host_network_event:
             self.host_network_event.cancel()
             self.host_network_event = None
@@ -3616,10 +3667,7 @@ class CodenamesApp(App):
             self.discovery.stop()
             self.discovery = None
 
-        if self.network_client:
-
-            self.network_client.close()
-            self.network_client = None
+        self._drop_client()
 
         if self.network_server:
 

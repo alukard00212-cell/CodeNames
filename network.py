@@ -315,6 +315,35 @@ class GameTCPServer(socketserver.ThreadingTCPServer):
             self.host_role = role
 
         return True
+    # Tell every client the lobby is closing, then drop their sockets
+    def disconnect_all(self, message=None):
+
+        if message is not None:
+            self.broadcast(message)
+
+        with self.clients_lock:
+            handlers = list(self.clients.values())
+            self.clients.clear()
+
+        for handler in handlers:
+
+            request = getattr(handler, "request", None)
+
+            if request is None:
+                continue
+
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+
+            except OSError:
+                pass
+
+            try:
+                request.close()
+
+            except OSError:
+                pass
+
     # Send a message to every connected player
     def broadcast(self, message):
 
@@ -493,6 +522,13 @@ class GameServer:
     def stop(self):
 
         if self.server is not None:
+
+            # Guests should learn the lobby is gone instead of waiting
+            # for a dead socket.
+            self.server.disconnect_all({
+                "type": "disconnected",
+                "message": "The host closed the lobby."
+            })
 
             self.server.shutdown()
             self.server.server_close()
