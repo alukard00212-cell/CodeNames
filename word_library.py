@@ -1,50 +1,45 @@
-import json
 import random
-from pathlib import Path
+
+import i18n
 
 
-# The project ships its word data in `Data/Words`. Android file systems are
-# case-sensitive, so never rely on the desktop's case-insensitive lookup:
-# anchor everything to this module's directory and try the known spellings.
-BASE_DIR = Path(__file__).resolve().parent
-
-
+# The word lists live next to the language packs in `Data/Lang/<code>.json`
+# (older builds used `Data/Words`; i18n still reads those as a fallback).
+# Android file systems are case-sensitive, so the lookup lives in i18n.py
+# where every known spelling is tried.
 class WordLibrary:
 
-    def __init__(self, language="en"):
-        self.language = language
+    def __init__(self, language=None):
+        self.language = language or i18n.code()
         self.words = self.load_words()
 
-    def _candidate_paths(self):
-        names = ("Data/Words", "Data/words", "data/Words", "data/words")
-
-        return [BASE_DIR / name / f"{self.language}.json" for name in names]
-
     def load_words(self):
-        file_path = next(
-            (path for path in self._candidate_paths() if path.exists()),
-            None,
-        )
+        words = i18n.word_list(self.language)
 
-        if file_path is None:
-            tried = ", ".join(str(path) for path in self._candidate_paths())
-
+        if not words:
             raise FileNotFoundError(
-                f"Word library not found. Tried: {tried}"
+                f"Word library is empty. Add words to {self.source} "
+                f"(at least {i18n.MIN_WORDS})."
             )
 
-        with open(file_path, "r", encoding="utf-8") as file:
-            words = json.load(file)
-
-        if not isinstance(words, list):
-            raise ValueError("Word library must contain a list of words.")
+        if len(words) < i18n.MIN_WORDS:
+            raise ValueError(
+                f"{self.source} has only {len(words)} words. "
+                f"Add {i18n.MIN_WORDS - len(words)} more "
+                f"(at least {i18n.MIN_WORDS} are needed for one board)."
+            )
 
         return words
+
+    @property
+    def source(self):
+        return str(i18n.word_source(self.language))
 
     def get_random_words(self, amount=25):
         if len(self.words) < amount:
             raise ValueError(
-                f"Not enough words in {self.language} library."
+                f"Not enough words in {self.source}: "
+                f"{len(self.words)} available, {amount} needed."
             )
 
         return random.sample(self.words, amount)

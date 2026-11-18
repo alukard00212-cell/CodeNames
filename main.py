@@ -19,6 +19,13 @@ from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 import platform_utils
+import i18n
+
+from settings import (
+    NAME_MAX_LENGTH,
+    clean_player_name,
+    settings_for_app,
+)
 
 from network import (
     DISCOVERY_PORT,
@@ -26,15 +33,8 @@ from network import (
     GameClient,
     GameServer,
     PORT,
+    SHARED_TEAM,
     discover_hosts,
-)
-
-from qr_join import (
-    build_join_payload,
-    is_scan_supported,
-    parse_join_payload,
-    scan_qr_code,
-    QRCodeWidget,
 )
 
 from theme import (
@@ -81,9 +81,10 @@ from ui_widgets import (
 from word_library import WordLibrary
 
 
-# A full match needs 4 players in the lobby. The host is a player
-# too (they pick a team and role), so this means host + 3 clients.
-MIN_PLAYERS = 4
+# Minimum players depend on spymaster mode:
+# 1 shared spymaster -> 3 players, 2 spymasters -> 4 players.
+# The host is a player too (they pick a team and role).
+MIN_PLAYERS = 4  # 2-spymaster/default minimum.
 
 # How many log lines the sidebar keeps visible at once.
 LOG_VISIBLE = 8
@@ -104,7 +105,15 @@ class CodenamesApp(App):
             except Exception:
                 pass
 
-        self.word_library = WordLibrary("en")
+        # Settings and language must exist before any widget is created:
+        # every label is translated as it is built. The bundled font is
+        # registered as Kivy's default family (Latin + Persian glyphs).
+        self.settings = settings_for_app(self)
+        i18n.load(self.settings.language)
+        i18n.install_fonts()
+
+        self.player_name = self.settings.player_name
+        self.word_library, self.word_error = self._make_word_library()
 
         self.network_server = None
         self.network_client = None
@@ -112,14 +121,11 @@ class CodenamesApp(App):
         self.host_poll_event = None
         self.client_poll_event = None
 
-        # Hosting metadata used by LAN discovery and the QR fallback.
+        # Hosting metadata used by LAN discovery.
         self.host_port = PORT
         self.host_ip = "127.0.0.1"
         self.host_ssid = ""
         self.host_network_kind = "WI-FI"
-        self.hotspot_ssid = ""
-        self.hotspot_password = ""
-        self.scanned_ssid = ""
 
         # LAN discovery: host advertises, client scans.
         self.discovery = None
@@ -130,7 +136,6 @@ class CodenamesApp(App):
         self.join_lobbies = []
         self.lobby_list_box = None
         self.lobby_status_label = None
-        self._last_scan_payload = None
 
         # Shown above the lobby list after a failed/lost connection.
         self._join_notice = None
@@ -141,8 +146,6 @@ class CodenamesApp(App):
         self._layout_signature_saved = self._layout_signature()
         self._resize_event = None
         self._overlay_root = None
-        self._qr_refresh_event = None
-        self._manual_join_open = False
 
         # ---------------------------------------------------
         # HOST GAME STATE
@@ -156,6 +159,10 @@ class CodenamesApp(App):
         self.game_over = False
         self.spymaster_cards = []
 
+        # 1 = one shared spymaster for both teams,
+        # 2 = one spymaster per team (the default).
+        self.spymaster_mode = 2
+
         # The host is a player too: team + role in the lobby.
         self.host_team = "red"
         self.host_role = "spymaster"
@@ -163,10 +170,10 @@ class CodenamesApp(App):
         # ---------------------------------------------------
         # CLIENT GAME STATE
         # ---------------------------------------------------
-        self.client_name = "Player"
+        self.client_name = self.player_name
         self.client_key = None
         self.client_team = None
-        self.client_role = "operative"
+        self.client_role = None
         self.client_lobby = []
 
         self.client_words = []
@@ -196,6 +203,15 @@ class CodenamesApp(App):
         container.add_widget(self.create_menu())
 
         return container
+
+    def _make_word_library(self):
+        """Load the word list, keeping a readable error instead of crashing."""
+
+        try:
+            return WordLibrary(i18n.code()), None
+
+        except (ValueError, FileNotFoundError) as error:
+            return None, str(error)
 
     # -----------------------------------------------------------------
     # RESPONSIVE / LIFECYCLE
@@ -231,7 +247,7 @@ class CodenamesApp(App):
         if self._game_over_shown:
             return
 
-        # A QR overlay is cheap to reopen; drop it so the rebuilt
+        # A modal overlay is cheap to reopen; drop it so the rebuilt
         # screen uses the new orientation.
         if self._overlay_root is not None:
             self._close_overlay(rebuild=False)
@@ -261,8 +277,7 @@ class CodenamesApp(App):
         root.add_widget(builder())
 
     def on_pause(self):
-        # Keep hosting/connections alive when Android backgrounds the app
-        # (for example while the QR scanner is open).
+        # Keep hosting/connections alive when Android backgrounds the app.
         return True
 
     def on_resume(self):
@@ -274,15 +289,39 @@ class CodenamesApp(App):
         if key != 27:
             return False
 
+        # The result overlay is the topmost thing on screen.
+        if self._game_over_shown:
+            self.return_to_lobby(None)
+            return True
+
+        # Any modal dialog closes first.
         if self._overlay_root is not None:
             self._close_overlay()
             return True
 
-        if self._screen_name != "menu":
-            self.return_to_menu(None)
-            return True
+        name = self._screen_name
 
-        return False
+        if name == "menu":
+            self.confirm_exit()
+
+        elif name in ("play", "join", "how_to_play"):
+            self.return_to_menu(None)
+
+        elif name == "host":
+            self.confirm_close_lobby()
+
+        elif name in ("team_selection", "client_waiting"):
+            self.confirm_leave_lobby()
+
+        elif name in (
+            "host_game",
+            "host_spymaster",
+            "client_game",
+            "client_spymaster",
+        ):
+            self.confirm_leave_match()
+
+        return True
 
     def _clamp_width(self, value, margin=dp(24)):
         width = Window.width
@@ -291,6 +330,271 @@ class CodenamesApp(App):
             return value
 
         return min(value, max(dp(240), width - margin))
+
+    # -----------------------------------------------------------------
+    # CONFIRM DIALOGS / SETTINGS
+    # -----------------------------------------------------------------
+
+    def _confirm(self, title, message, action_text, on_confirm, danger=False):
+        """Small modal with cancel + one confirming action."""
+
+        compact = self._is_compact()
+
+        panel = Panel(
+            orientation="vertical",
+            width=self._clamp_width(dp(350)),
+            height=dp(204) if compact else dp(222),
+            size_hint=(None, None),
+            padding=[
+                dp(20) if compact else dp(24),
+                dp(16) if compact else dp(20),
+                dp(20) if compact else dp(24),
+                dp(16) if compact else dp(20),
+            ],
+            spacing=dp(8) if compact else dp(10),
+        )
+
+        panel.add_widget(
+            self._label(
+                title,
+                dp(11),
+                RED if danger else ACCENT,
+                bold=True,
+                halign="center",
+                height=dp(18),
+            )
+        )
+
+        detail = self._label(
+            message,
+            dp(12) if compact else dp(13),
+            TEXT,
+            halign="center",
+            height=dp(56),
+        )
+        detail.bind(
+            width=lambda instance, width: setattr(
+                instance, "text_size", (width, None)
+            )
+        )
+        panel.add_widget(detail)
+        panel.add_widget(Widget(size_hint_y=1))
+
+        row = BoxLayout(
+            orientation="horizontal",
+            size_hint=(1, None),
+            height=dp(44) if compact else dp(48),
+            spacing=dp(8),
+        )
+
+        cancel_button = FlatButton(
+            text="CANCEL",
+            variant="ghost",
+            font_size=dp(11) if compact else dp(12),
+            size_hint=(1, 1),
+        )
+        cancel_button.bind(on_press=self._close_overlay)
+
+        confirm_button = FlatButton(
+            text=action_text,
+            variant="danger" if danger else "primary",
+            font_size=dp(11) if compact else dp(12),
+            size_hint=(1, 1),
+        )
+
+        def confirmed(instance):
+            self._close_overlay(rebuild=False)
+            on_confirm()
+
+        confirm_button.bind(on_press=confirmed)
+
+        row.add_widget(cancel_button)
+        row.add_widget(confirm_button)
+        panel.add_widget(row)
+
+        self._open_overlay(panel)
+
+    def confirm_exit(self):
+        self._confirm(
+            i18n.t("EXIT CODENAMES?"),
+            i18n.t("Are you sure you want to exit?"),
+            i18n.t("EXIT"),
+            platform_utils.quit_app,
+            danger=True,
+        )
+
+    def confirm_close_lobby(self):
+        count = 0
+
+        if self.network_server is not None:
+            try:
+                count = max(
+                    0,
+                    len(self.network_server.server.get_lobby()) - 1,
+                )
+            except Exception:
+                count = 0
+
+        self._confirm(
+            i18n.t("CLOSE THE LOBBY?"),
+            i18n.t(
+                "{count} connected players will be disconnected.",
+                count=count,
+            ),
+            i18n.t("CLOSE"),
+            lambda: self.return_to_menu(None),
+            danger=True,
+        )
+
+    def confirm_leave_lobby(self):
+        self._confirm(
+            i18n.t("LEAVE THE LOBBY?"),
+            i18n.t("You will leave this lobby."),
+            i18n.t("LEAVE"),
+            lambda: self.return_to_menu(None),
+            danger=True,
+        )
+
+    def confirm_leave_match(self):
+        host_side = self._screen_name in ("host_game", "host_spymaster")
+
+        self._confirm(
+            i18n.t("LEAVE THE MATCH?"),
+            i18n.t(
+                "The match will end for every player."
+                if host_side
+                else "You will leave this match."
+            ),
+            i18n.t("LEAVE"),
+            lambda: self.return_to_lobby(None)
+            if host_side
+            else self.return_to_menu(None),
+            danger=True,
+        )
+
+    def show_name_dialog(self, instance=None):
+        compact = self._is_compact()
+
+        panel = Panel(
+            orientation="vertical",
+            width=self._clamp_width(dp(340)),
+            height=dp(196) if compact else dp(208),
+            size_hint=(None, None),
+            padding=[dp(20), dp(16), dp(20), dp(16)],
+            spacing=dp(8) if compact else dp(10),
+        )
+
+        panel.add_widget(
+            self._label(
+                "CHANGE NAME",
+                dp(10),
+                ACCENT,
+                bold=True,
+                halign="center",
+                height=dp(18),
+            )
+        )
+
+        field = FlatInput(
+            text=(
+                ""
+                if self.player_name == "Player"
+                else self.player_name
+            ),
+            hint_text="Enter your name",
+            max_length=NAME_MAX_LENGTH,
+            height=dp(44),
+        )
+        panel.add_widget(field)
+
+        panel.add_widget(
+            self._label(
+                "{count} characters max.".format(
+                    count=NAME_MAX_LENGTH
+                ),
+                dp(10),
+                MUTED,
+                halign="center",
+                height=dp(16),
+            )
+        )
+        panel.add_widget(Widget(size_hint_y=1))
+
+        row = BoxLayout(
+            orientation="horizontal",
+            size_hint=(1, None),
+            height=dp(44),
+            spacing=dp(8),
+        )
+
+        cancel_button = FlatButton(
+            text="CANCEL",
+            variant="ghost",
+            font_size=dp(11),
+            size_hint=(1, 1),
+        )
+        cancel_button.bind(on_press=self._close_overlay)
+
+        save_button = FlatButton(
+            text="SAVE",
+            variant="primary",
+            font_size=dp(11),
+            size_hint=(1, 1),
+        )
+
+        def saved(instance):
+            name = clean_player_name(
+                field.text,
+                fallback=self.player_name,
+            )
+
+            self.settings.set("player_name", name)
+            self.player_name = name
+            self.client_name = name
+
+            self._close_overlay(rebuild=False)
+            self.show_screen(self.create_menu, "menu")
+
+        save_button.bind(on_press=saved)
+
+        row.add_widget(cancel_button)
+        row.add_widget(save_button)
+        panel.add_widget(row)
+
+        self._open_overlay(panel)
+        field.focus = True
+
+    def show_language_dialog(self, instance=None):
+        current = i18n.code()
+        target = next(
+            (
+                entry
+                for entry in i18n.available_languages()
+                if entry["code"] != current
+            ),
+            None,
+        )
+
+        if target is None:
+            return
+
+        self._confirm(
+            i18n.t("CHANGE LANGUAGE?"),
+            i18n.t(
+                "Switch the game to {language}?",
+                language=target["native_name"],
+            ),
+            i18n.t("CHANGE"),
+            lambda: self.set_language(target["code"]),
+        )
+
+    def set_language(self, code):
+        self.settings.set("language", code)
+        i18n.load(code)
+        i18n.install_fonts()
+        self.word_library, self.word_error = self._make_word_library()
+
+        self.show_screen(self.create_menu, "menu")
 
     def _host_spymaster_builder(self):
         lobby = (
@@ -528,7 +832,7 @@ class CodenamesApp(App):
         max_lines=None,
     ):
         label = Label(
-            text=text,
+            text=i18n.t(text),
             font_size=size,
             color=color,
             bold=bold,
@@ -586,7 +890,7 @@ class CodenamesApp(App):
         )
 
         brand = Label(
-            text=brand_text,
+            text=i18n.t(brand_text),
             font_size=dp(12) if compact else dp(15),
             bold=True,
             color=TEXT,
@@ -607,7 +911,7 @@ class CodenamesApp(App):
         # on a phone top bar.
         if badge_text and not compact:
             badge = Label(
-                text=badge_text,
+                text=i18n.t(badge_text),
                 font_size=dp(11),
                 bold=True,
                 color=TEAM_COLORS.get(badge_team, MUTED),
@@ -680,8 +984,13 @@ class CodenamesApp(App):
         team_hex = TEAM_HEX.get(team, "8B96A8")
 
         self.add_log(
-            f"Turn passed · "
-            f"[b][color=#{team_hex}]{str(team).upper()}[/color][/b]",
+            i18n.t(
+                "Turn passed · {team}",
+                team=(
+                    f"[b][color=#{team_hex}]"
+                    f"{i18n.t(str(team).upper())}[/color][/b]"
+                ),
+            ),
             team,
         )
 
@@ -694,7 +1003,9 @@ class CodenamesApp(App):
         entries = self.match_log[-LOG_VISIBLE:]
 
         if not entries:
-            label.text = "[color=#5C6675]No moves yet.[/color]"
+            label.text = (
+                f"[color=#5C6675]{i18n.t('No moves yet.')}[/color]"
+            )
             return
 
         lines = []
@@ -705,14 +1016,31 @@ class CodenamesApp(App):
 
         label.text = "\n".join(lines)
 
-    def _role_button(self, team, role, callback, height=dp(58)):
+    def _role_button(
+        self,
+        team,
+        role,
+        callback,
+        height=dp(58),
+        text=None,
+        tone=None,
+    ):
+        if text is None:
+            team_text = (
+                i18n.t("SHARED")
+                if team == SHARED_TEAM
+                else i18n.t(str(team).upper())
+            )
+            role_text = i18n.t(str(role).upper())
+            text = (
+                f"[b]{team_text}[/b]\n"
+                f"[size=10]{role_text}[/size]"
+            )
+
         button = FlatButton(
-            text=(
-                f"[b]{team.upper()}[/b]\n"
-                f"[size=10]{role.upper()}[/size]"
-            ),
+            text=text,
             markup=True,
-            tone=team,
+            tone=tone if tone is not None else team,
             font_size=dp(13),
             size_hint=(1, None),
             height=height,
@@ -741,47 +1069,114 @@ class CodenamesApp(App):
         for name in ("red", "blue", "neutral", "assassin"):
             colour = TEAM_HEX.get(name, "8B96A8")
             parts.append(
-                f"[color=#{colour}]•[/color] {name.upper()} {counts[name]}"
+                f"[color=#{colour}]•[/color] "
+                f"{i18n.t(name.upper())} {counts[name]}"
             )
 
         return "    ".join(parts)
-# START MULTIPLAYER MATCH
+    def _lobby_blocker(self, lobby):
+        """Return a human-readable reason the match cannot start yet."""
+
+        total_players = len(lobby)
+        min_players = 3 if self.spymaster_mode == 1 else 4
+
+        if total_players < min_players:
+            return i18n.t(
+                "At least {minimum} players are needed "
+                "(host + {others}). Currently {total}; "
+                "waiting for {needed} more.",
+                minimum=min_players,
+                others=min_players - 1,
+                total=total_players,
+                needed=min_players - total_players,
+            )
+
+        unassigned = sum(
+            1
+            for player in lobby
+            if player.get("team") is None
+            or player.get("role") is None
+        )
+
+        if unassigned:
+            return i18n.t(
+                "{count} players still need a role.",
+                count=unassigned,
+            )
+
+        mode = self.spymaster_mode
+
+        if mode == 1:
+            spymasters = [
+                player
+                for player in lobby
+                if player.get("role") == "spymaster"
+            ]
+
+            if not (
+                len(spymasters) == 1
+                and spymasters[0].get("team") == SHARED_TEAM
+            ):
+                return i18n.t("One shared spymaster is required.")
+
+            for team in ("red", "blue"):
+                if not any(
+                    player.get("team") == team
+                    and player.get("role") == "operative"
+                    for player in lobby
+                ):
+                    return i18n.t(
+                        "{team} has no operative.",
+                        team=i18n.t(team.upper()),
+                    )
+
+            return None
+
+        for team in ("red", "blue"):
+            if not any(
+                player.get("team") == team
+                and player.get("role") == "spymaster"
+                for player in lobby
+            ):
+                return i18n.t(
+                    "{team} has no spymaster.",
+                    team=i18n.t(team.upper()),
+                )
+
+            if not any(
+                player.get("team") == team
+                and player.get("role") == "operative"
+                for player in lobby
+            ):
+                return i18n.t(
+                    "{team} has no operative.",
+                    team=i18n.t(team.upper()),
+                )
+
+        return None
+
+    # START MULTIPLAYER MATCH
     def start_host_match(self, instance):
 
         if not self.network_server:
+            return
+
+        if self.word_library is None:
+            self.host_status_label.text = (
+                self.word_error or i18n.t("The hosting server failed.")
+            )
             return
 
         server = self.network_server.server
 
         lobby = server.get_lobby()
 
-        clients = [
-            player
-            for player in lobby
-            if not player.get("is_host")
-        ]
+        self.spymaster_mode = server.spymaster_mode
 
-        total_players = len(clients) + 1  # +1 for the host
+        blocker = self._lobby_blocker(lobby)
 
-        if total_players < MIN_PLAYERS:
-
-            needed = MIN_PLAYERS - total_players
-
-            self.host_status_label.text = (
-                f"At least {MIN_PLAYERS} players are needed "
-                f"(host + {MIN_PLAYERS - 1}). "
-                f"Currently {total_players}; waiting for "
-                f"{needed} more."
-            )
-            return
-
-        if not all(
-            player.get("team") in ("red", "blue")
-            for player in clients
-        ):
-            self.host_status_label.text = (
-                "Every player must choose a team first."
-            )
+        if blocker is not None:
+            self.host_status_label.text = blocker
             return
 
         # The host's own role was picked in the lobby.
@@ -836,24 +1231,20 @@ class CodenamesApp(App):
             "type": "game_started",
             "words": self.words,
             "current_team": self.current_team,
-            "remaining": dict(self.remaining)
+            "remaining": dict(self.remaining),
+            "spymaster_mode": self.spymaster_mode,
         })
 
-        # Only send the key to the spymasters of each team.
-        for team in ("red", "blue"):
-
-            self.network_server.send_to_role(
-                team,
-                "spymaster",
-                {
-                    "type": "spy_key",
-                    "team": team,
-                    "words": self.words,
-                    "roles": self.roles,
-                    "current_team": self.current_team,
-                    "remaining": dict(self.remaining)
-                }
-            )
+        # Only the spymasters receive the secret key. In mode 1 that
+        # is the single shared spymaster; in mode 2 both team
+        # spymasters get the full key (they may share one phone).
+        self.network_server.send_to_spymasters({
+            "type": "spy_key",
+            "words": self.words,
+            "roles": self.roles,
+            "current_team": self.current_team,
+            "remaining": dict(self.remaining),
+        })
 
         # Stop lobby polling
         if self.host_poll_event:
@@ -884,11 +1275,13 @@ class CodenamesApp(App):
 
         root = ScreenRoot()
 
+        layer = FloatLayout()
+
         card = BoxLayout(
             orientation="vertical",
             size_hint=(None, None),
             width=self._clamp_width(dp(390)),
-            height=dp(404) if compact else dp(468),
+            height=dp(330) if compact else dp(374),
             spacing=dp(8) if compact else dp(10),
         )
 
@@ -910,7 +1303,7 @@ class CodenamesApp(App):
         )
 
         title = Label(
-            text="CODENAMES",
+            text=i18n.t("CODENAMES"),
             font_size=dp(38) if compact else dp(50),
             bold=True,
             color=TEXT,
@@ -947,24 +1340,12 @@ class CodenamesApp(App):
             height=dp(44) if compact else dp(48),
         )
 
-        exit_button = FlatButton(
-            text="EXIT",
-            variant="ghost",
-            font_size=dp(13) if compact else dp(14),
-            size_hint=(1, None),
-            height=dp(44) if compact else dp(48),
-        )
-
         play_button.bind(
             on_press=self.show_play_screen
         )
 
         how_to_play.bind(
             on_press=self.show_how_to_play
-        )
-
-        exit_button.bind(
-            on_press=self.stop
         )
 
         card.add_widget(mark_wrap)
@@ -974,9 +1355,56 @@ class CodenamesApp(App):
         card.add_widget(gap)
         card.add_widget(play_button)
         card.add_widget(how_to_play)
-        card.add_widget(exit_button)
 
-        root.add_widget(self._centered_scroll(card))
+        layer.add_widget(self._centered_scroll(card))
+
+        # Player name chip (top-left) ------------------------------
+
+        name_holder = AnchorLayout(
+            anchor_x="left",
+            anchor_y="top",
+            size_hint=(None, None),
+            size=(
+                self._clamp_width(dp(250), margin=dp(16)),
+                dp(42),
+            ),
+            pos_hint={"x": 0, "top": 1},
+        )
+
+        name_button = FlatButton(
+            text=(
+                f"{i18n.t('YOUR NAME')} · {self.player_name}"
+            ),
+            variant="ghost",
+            font_size=dp(11),
+            size_hint=(1, 1),
+        )
+        name_button.bind(on_press=self.show_name_dialog)
+        name_holder.add_widget(name_button)
+
+        # Language button (bottom-right) ---------------------------
+
+        language_holder = AnchorLayout(
+            anchor_x="right",
+            anchor_y="bottom",
+            size_hint=(None, None),
+            size=(dp(150), dp(42)),
+            pos_hint={"right": 1, "y": 0},
+        )
+
+        language_button = FlatButton(
+            text=i18n.native_name(),
+            variant="ghost",
+            font_size=dp(12),
+            size_hint=(1, 1),
+        )
+        language_button.bind(on_press=self.show_language_dialog)
+        language_holder.add_widget(language_button)
+
+        layer.add_widget(name_holder)
+        layer.add_widget(language_holder)
+
+        root.add_widget(layer)
 
         return root
 
@@ -1009,7 +1437,7 @@ class CodenamesApp(App):
         )
 
         title = Label(
-            text="PLAY",
+            text=i18n.t("PLAY"),
             font_size=dp(34) if compact else dp(40),
             bold=True,
             color=TEXT,
@@ -1112,9 +1540,14 @@ class CodenamesApp(App):
         )
 
         if self.network_server:
-            # The host's default assignment lives on the server.
-            self.host_team = self.network_server.server.host_team
-            self.host_role = self.network_server.server.host_role
+            # The host is a player too: the server keeps the lobby row.
+            server = self.network_server.server
+            server.host_name = self.player_name
+
+            server.set_spymaster_mode(self.spymaster_mode)
+
+            self.host_team = server.host_team
+            self.host_role = server.host_role
 
             # Port 0 (a busy 5000) is resolved by the OS; read it back so
             # discovery replies always contain the real port.
@@ -1153,21 +1586,7 @@ class CodenamesApp(App):
         self.host_network_kind = kind
         self.host_ssid = name
 
-        label = getattr(self, "host_network_label", None)
-
-        if label is not None:
-            label.text = self._network_label_text()
-
         return True
-
-    def _network_label_text(self):
-        kind = self.host_network_kind or "WI-FI"
-        name = self.host_ssid
-
-        if not name:
-            return f"{kind} · name hidden"
-
-        return f"{kind} · {name}"
 
     def _discovery_info(self):
         """Payload a probing client receives. Runs on the UDP thread."""
@@ -1189,7 +1608,7 @@ class CodenamesApp(App):
             "ssid": self.host_ssid,
             "kind": self.host_network_kind,
             "players": players,
-            "max": 8,
+            "host_name": self.player_name,
         }
 
     def _start_discovery(self):
@@ -1230,91 +1649,41 @@ class CodenamesApp(App):
         root = ScreenRoot()
 
         # ---------------------------------------------------------
-        # HEADER
+        # HEADER (host name + leave; the back key asks the same thing)
         # ---------------------------------------------------------
 
         header = BoxLayout(
             orientation="horizontal",
             size_hint=(1, None),
-            height=dp(48) if compact else dp(58),
+            height=dp(46) if compact else dp(58),
             spacing=dp(8),
         )
 
-        titles = BoxLayout(orientation="vertical", spacing=0)
-        titles.add_widget(
+        header.add_widget(
             self._label(
-                "HOSTING",
-                dp(10) if compact else dp(11),
-                ACCENT,
-                bold=True,
-                height=dp(14) if compact else dp(16),
-            )
-        )
-        titles.add_widget(
-            self._label(
-                "HOST LOBBY",
+                self.player_name,
                 dp(20) if compact else dp(26),
                 TEXT,
                 bold=True,
                 height=dp(28) if compact else dp(34),
+                shorten=True,
+                max_lines=1,
             )
         )
 
-        back_button = FlatButton(
-            text="BACK",
+        leave_button = FlatButton(
+            text="LEAVE",
             variant="ghost",
             font_size=dp(11) if compact else dp(12),
             size_hint=(None, 1),
-            width=dp(90) if compact else dp(150),
+            width=dp(82) if compact else dp(130),
         )
-        back_button.bind(on_press=self.return_to_menu)
+        leave_button.bind(
+            on_press=lambda instance: self.confirm_close_lobby()
+        )
 
-        header.add_widget(titles)
-        header.add_widget(back_button)
-
+        header.add_widget(leave_button)
         root.add_widget(header)
-
-        # ---------------------------------------------------------
-        # NETWORK BANNER (which Wi-Fi / hotspot the players share)
-        # ---------------------------------------------------------
-
-        network_row = Panel(
-            orientation="horizontal",
-            fill=SURFACE_HI,
-            border=BORDER_SOFT,
-            radius=RADIUS_SM,
-            padding=[
-                dp(12) if compact else dp(16),
-                dp(6),
-                dp(12) if compact else dp(16),
-                dp(6),
-            ],
-            spacing=dp(8),
-            size_hint=(1, None),
-            height=dp(34) if compact else dp(40),
-        )
-
-        network_row.add_widget(
-            self._label(
-                "ON THIS NETWORK",
-                dp(9) if compact else dp(10),
-                MUTED,
-                bold=True,
-                height=dp(12) if compact else dp(14),
-            )
-        )
-
-        self.host_network_label = self._label(
-            self._network_label_text(),
-            dp(12) if compact else dp(13),
-            ACCENT,
-            bold=True,
-            halign="right",
-            shorten=True,
-        )
-        network_row.add_widget(self.host_network_label)
-
-        root.add_widget(network_row)
 
         # ---------------------------------------------------------
         # SERVER FAILED
@@ -1323,8 +1692,7 @@ class CodenamesApp(App):
         if not self.network_server:
 
             self.start_match_button = None
-            self.host_qr_button = None
-            self.host_network_label.text = "SERVER OFFLINE"
+            self.host_role_buttons = {}
 
             panel = Panel(
                 orientation="vertical",
@@ -1370,9 +1738,15 @@ class CodenamesApp(App):
         # LOBBY CONTENT
         # ---------------------------------------------------------
 
-        # Keep the banner truthful and ask Android for the SSID once.
+        # Keep the SSID truthful: it is the fallback label when a client
+        # cannot read the host name, and discovery replies carry it.
         self._refresh_host_network()
         self._ask_for_network_permission()
+
+        server = self.network_server.server
+        self.spymaster_mode = server.spymaster_mode
+        self.host_team = server.host_team
+        self.host_role = server.host_role
 
         left = Panel(
             orientation="vertical",
@@ -1408,7 +1782,7 @@ class CodenamesApp(App):
             padding=[dp(12), dp(10), dp(12), dp(10)],
             spacing=dp(5),
             size_hint=(1, None),
-            height=dp(116) if compact else dp(124),
+            height=dp(74) if compact else dp(82),
         )
 
         join_panel.add_widget(
@@ -1428,8 +1802,8 @@ class CodenamesApp(App):
 
         if self.discovery_error is not None:
             join_hint = (
-                "Auto-discovery could not start. Use the QR code "
-                "instead."
+                "Auto-discovery could not start. Players can still "
+                "join from the lobby list."
             )
 
         join_panel.add_widget(
@@ -1440,18 +1814,6 @@ class CodenamesApp(App):
                 height=dp(34),
             )
         )
-
-        # The QR code is the fallback for networks that block the UDP
-        # discovery broadcast (guest Wi-Fi with client isolation).
-        self.host_qr_button = FlatButton(
-            text="SHOW QR CODE",
-            variant="ghost",
-            font_size=dp(11) if compact else dp(12),
-            size_hint=(1, None),
-            height=dp(36) if compact else dp(40),
-        )
-        self.host_qr_button.bind(on_press=self.show_qr_modal)
-        join_panel.add_widget(self.host_qr_button)
 
         left.add_widget(join_panel)
 
@@ -1480,15 +1842,6 @@ class CodenamesApp(App):
         )
         left.add_widget(self.host_status_label)
 
-        left.add_widget(
-            self._label(
-                "Minimum 4 players — host + 3 guests.",
-                dp(10) if compact else dp(11),
-                MUTED,
-                height=dp(16),
-            )
-        )
-
         # Role picker ---------------------------------------------
 
         right.add_widget(
@@ -1501,39 +1854,18 @@ class CodenamesApp(App):
             )
         )
 
-        role_grid = GridLayout(
-            cols=2,
-            rows=2,
-            spacing=dp(6) if compact else dp(8),
-            size_hint=(1, None),
-            height=dp(112) if compact else dp(126),
-        )
-
         self.host_role_buttons = {}
-        assignments = (
-            ("red", "spymaster"),
-            ("red", "operative"),
-            ("blue", "spymaster"),
-            ("blue", "operative"),
+
+        role_box = BoxLayout(
+            orientation="vertical",
+            size_hint=(1, None),
+            spacing=dp(6) if compact else dp(8),
         )
 
-        for team, role in assignments:
-            button = self._role_button(
-                team,
-                role,
-                self.choose_host_assignment,
-                height=dp(52) if compact else dp(58),
-            )
-            self.host_role_buttons[(team, role)] = button
-            role_grid.add_widget(button)
-
-        self._refresh_role_buttons(
-            self.host_role_buttons,
-            self.host_team,
-            self.host_role,
+        role_box.height = self._build_host_role_controls(
+            role_box, compact
         )
-
-        right.add_widget(role_grid)
+        right.add_widget(role_box)
 
         self.host_role_label = self._label(
             self.get_host_role_text(),
@@ -1542,6 +1874,20 @@ class CodenamesApp(App):
             height=dp(18),
         )
         right.add_widget(self.host_role_label)
+
+        self.host_role_hint = self._label(
+            (
+                "One shared spymaster sees the key for both teams; "
+                "everyone else is an operative."
+                if self.spymaster_mode == 1
+                else "Each team has one spymaster (sees the key) and "
+                "any number of operatives (pick cards)."
+            ),
+            dp(9) if compact else dp(10),
+            MUTED,
+            height=dp(26) if compact else dp(30),
+        )
+        right.add_widget(self.host_role_hint)
 
         right.add_widget(
             self._label(
@@ -1553,39 +1899,52 @@ class CodenamesApp(App):
             )
         )
 
-        minimum_row = Panel(
+        mode_row = BoxLayout(
             orientation="horizontal",
-            fill=SURFACE_HI,
-            border=BORDER_SOFT,
-            radius=RADIUS_SM,
-            padding=[dp(12), dp(8), dp(12), dp(8)],
-            spacing=dp(8),
             size_hint=(1, None),
-            height=dp(38),
+            height=dp(34) if compact else dp(38),
+            spacing=dp(6),
         )
-        minimum_row.add_widget(
-            self._label("Minimum players", dp(12), MUTED)
-        )
-        minimum_row.add_widget(
-            Label(
-                text=str(MIN_PLAYERS),
-                font_size=dp(13),
-                bold=True,
-                color=TEXT,
-                size_hint=(None, 1),
-                width=dp(24),
-                halign="right",
-                valign="middle",
+
+        self.host_mode_buttons = {}
+
+        for mode, mode_text in (
+            (1, "1 · BOTH TEAMS"),
+            (2, "2 · ONE PER TEAM"),
+        ):
+            button = FlatButton(
+                text=mode_text,
+                variant=(
+                    "primary"
+                    if self.spymaster_mode == mode
+                    else "ghost"
+                ),
+                font_size=dp(10) if compact else dp(11),
+                size_hint=(1, 1),
             )
-        )
-        right.add_widget(minimum_row)
+            button.bind(
+                on_press=lambda instance, value=mode: (
+                    self.set_spymaster_mode(value)
+                )
+            )
+
+            self.host_mode_buttons[mode] = button
+            mode_row.add_widget(button)
+
+        right.add_widget(mode_row)
 
         right.add_widget(Widget(size_hint_y=1))
 
+        min_players = 3 if self.spymaster_mode == 1 else 4
+
         self.start_match_button = FlatButton(
-            text=f"START GAME (1/{MIN_PLAYERS} PLAYERS)",
+            text=i18n.t(
+                "START GAME ({count}/{minimum} PLAYERS)",
+                count=1,
+                minimum=min_players,
+            ),
             variant="primary",
-            font_size=dp(14) if compact else dp(15),
+            font_size=dp(12) if compact else dp(14),
             size_hint=(1, None),
             height=dp(48) if compact else dp(52),
         )
@@ -1608,8 +1967,8 @@ class CodenamesApp(App):
         content = self._two_panel_content(
             left,
             right,
-            left_height=dp(308) if compact else dp(332),
-            right_height=dp(390) if compact else dp(420),
+            left_height=dp(270) if compact else dp(294),
+            right_height=dp(400) if compact else dp(428),
         )
 
         root.add_widget(content)
@@ -1617,305 +1976,222 @@ class CodenamesApp(App):
         self.update_host_lobby(0)
 
         return root
-    # -----------------------------------------------------------------
-    # QR JOIN MODAL
-    # -----------------------------------------------------------------
 
-    def _current_join_payload(self):
-        self.host_ip = platform_utils.get_host_ip()
-        port = int(getattr(self, "host_port", PORT) or PORT)
+    def _build_host_role_controls(self, container, compact):
+        """Fill the host's role picker for the current spymaster mode."""
 
-        return build_join_payload(
-            self.host_ip,
-            port,
-            self.hotspot_ssid,
-            self.hotspot_password,
+        return self._fill_role_picker(
+            container,
+            compact,
+            self.host_role_buttons,
+            self.choose_host_assignment,
+            self.host_team,
+            self.host_role,
         )
 
-    def _open_overlay(self, panel):
-        if self._overlay_root is not None:
-            self._close_overlay()
+    def _fill_role_picker(
+        self,
+        container,
+        compact,
+        buttons,
+        callback,
+        team,
+        role,
+    ):
+        """Build the mode-aware team/role grid + NO ROLE button."""
 
-        container = FloatLayout()
+        buttons.clear()
 
-        for child in reversed(list(self.root.children)):
-            self.root.remove_widget(child)
-            container.add_widget(child)
+        button_height = dp(48) if compact else dp(54)
 
-        container.add_widget(Scrim())
-
-        container.add_widget(self._centered_scroll(panel, margin=dp(10)))
-
-        self._overlay_root = container
-        self.root.add_widget(container)
-
-    def _close_overlay(self, instance=None, rebuild=True):
-        if self._overlay_root is None:
-            return
-
-        self._overlay_root = None
-
-        if self._qr_refresh_event is not None:
-            self._qr_refresh_event.cancel()
-            self._qr_refresh_event = None
-
-        if not rebuild:
-            return
-
-        builder = getattr(self, "_screen_builder", None)
-
-        self.root.clear_widgets()
-        self.root.add_widget(
-            builder() if builder else self.create_menu()
-        )
-
-    def show_qr_modal(self, instance=None):
-        if not self.network_server:
-            return
-
-        compact = self._is_compact()
-        qr_side = dp(190) if compact else dp(220)
-
-        panel = Panel(
-            orientation="vertical",
-            size_hint=(None, None),
-            width=self._clamp_width(dp(356)),
-            height=qr_side + dp(396),
-            padding=[dp(22), dp(18), dp(22), dp(18)],
-            spacing=dp(7),
-        )
-
-        panel.add_widget(
-            self._label(
-                "HOSTING",
-                dp(10),
-                ACCENT,
-                bold=True,
-                halign="center",
-                height=dp(14),
+        if self.spymaster_mode == 1:
+            shared = self._role_button(
+                SHARED_TEAM,
+                "spymaster",
+                callback,
+                height=button_height,
+                text=f"[b]{i18n.t('SPYMASTER · BOTH TEAMS')}[/b]",
+                tone=None,
             )
-        )
-        panel.add_widget(
-            self._label(
-                "SCAN TO JOIN",
-                dp(22) if compact else dp(24),
-                TEXT,
-                bold=True,
-                halign="center",
-                height=dp(32),
-            )
-        )
+            buttons[(SHARED_TEAM, "spymaster")] = shared
+            container.add_widget(shared)
 
-        panel.add_widget(
-            self._label(
-                "Fallback only: use this when the lobby list is empty.",
-                dp(9) if compact else dp(10),
-                MUTED,
-                halign="center",
-                height=dp(26),
-            )
-        )
-
-        qr_holder = AnchorLayout(
-            anchor_x="center",
-            anchor_y="center",
-            size_hint=(1, None),
-            height=qr_side,
-        )
-        self.qr_widget = QRCodeWidget(size=(qr_side, qr_side))
-        qr_holder.add_widget(self.qr_widget)
-        panel.add_widget(qr_holder)
-
-        self.qr_hint_label = self._label(
-            "",
-            dp(10),
-            MUTED,
-            halign="center",
-            height=dp(30),
-        )
-        self.qr_hint_label.bind(
-            width=lambda instance, width: setattr(
-                instance, "text_size", (width, None)
-            )
-        )
-        panel.add_widget(self.qr_hint_label)
-
-        panel.add_widget(
-            self._label(
-                "OPTIONAL HOTSPOT DETAILS",
-                dp(9),
-                MUTED,
-                bold=True,
-                height=dp(14),
-            )
-        )
-
-        self.qr_ssid_input = FlatInput(
-            text=self.hotspot_ssid or self.host_ssid,
-            hint_text="Hotspot name (optional)",
-            height=dp(40),
-        )
-        self.qr_password_input = FlatInput(
-            text=self.hotspot_password,
-            hint_text="Hotspot password (optional)",
-            height=dp(40),
-        )
-
-        for field in (self.qr_ssid_input, self.qr_password_input):
-            field.bind(on_text=self._schedule_qr_refresh)
-            panel.add_widget(field)
-
-        button_row = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=dp(42),
-            spacing=dp(8),
-        )
-
-        refresh_button = FlatButton(
-            text="UPDATE CODE",
-            variant="primary",
-            font_size=dp(11),
-            size_hint=(1, 1),
-        )
-        refresh_button.bind(on_press=self._refresh_qr_preview)
-
-        close_button = FlatButton(
-            text="CLOSE",
-            variant="ghost",
-            font_size=dp(11),
-            size_hint=(1, 1),
-        )
-        close_button.bind(on_press=self._close_overlay)
-
-        button_row.add_widget(refresh_button)
-        button_row.add_widget(close_button)
-        panel.add_widget(button_row)
-
-        if platform == "android":
-            settings_row = BoxLayout(
+            operative_row = BoxLayout(
                 orientation="horizontal",
                 size_hint=(1, None),
-                height=dp(34),
-                spacing=dp(8),
+                height=button_height,
+                spacing=dp(6) if compact else dp(8),
             )
 
-            wifi_button = FlatButton(
-                text="WI-FI SETTINGS",
-                variant="ghost",
-                font_size=dp(10),
-                size_hint=(1, 1),
-            )
-            wifi_button.bind(
-                on_press=lambda instance: platform_utils.open_wifi_settings()
-            )
-
-            hotspot_button = FlatButton(
-                text="HOTSPOT",
-                variant="ghost",
-                font_size=dp(10),
-                size_hint=(1, 1),
-            )
-            hotspot_button.bind(
-                on_press=lambda instance: (
-                    platform_utils.open_hotspot_settings()
+            for team_name in ("red", "blue"):
+                button = self._role_button(
+                    team_name,
+                    "operative",
+                    callback,
+                    height=button_height,
                 )
-            )
+                buttons[(team_name, "operative")] = button
+                operative_row.add_widget(button)
 
-            settings_row.add_widget(wifi_button)
-            settings_row.add_widget(hotspot_button)
-            panel.add_widget(settings_row)
+            container.add_widget(operative_row)
 
-        self._open_overlay(panel)
-        self._refresh_qr_preview()
+            used_height = button_height * 2 + dp(8)
 
-    def _schedule_qr_refresh(self, *args):
-        if self._qr_refresh_event is not None:
-            self._qr_refresh_event.cancel()
-
-        self._qr_refresh_event = Clock.schedule_once(
-            self._refresh_qr_preview, 0.35
-        )
-
-    def _refresh_qr_preview(self, *args):
-        self._qr_refresh_event = None
-
-        if not hasattr(self, "qr_widget"):
-            return
-
-        self.hotspot_ssid = self.qr_ssid_input.text.strip()
-        self.hotspot_password = self.qr_password_input.text.strip()
-
-        payload = self._current_join_payload()
-        self.qr_widget.data = payload
-
-        port = int(getattr(self, "host_port", PORT) or PORT)
-        ip = getattr(self, "host_ip", "127.0.0.1")
-
-        if ip == "127.0.0.1":
-            hint = (
-                "No Wi-Fi address found. Turn on the hotspot or join "
-                "a Wi-Fi network first."
-            )
-        elif platform == "android":
-            hint = (
-                "Every phone must be on this Wi-Fi/hotspot. "
-                "Keep this screen open while they scan."
-            )
         else:
-            hint = (
-                f"Desktop test address: {ip}:{port}"
+            grid = GridLayout(
+                cols=2,
+                rows=2,
+                spacing=dp(6) if compact else dp(8),
+                size_hint=(1, None),
+                height=button_height * 2 + dp(8),
             )
 
-        self.qr_hint_label.text = hint
+            for team_name, role_name in (
+                ("red", "spymaster"),
+                ("red", "operative"),
+                ("blue", "spymaster"),
+                ("blue", "operative"),
+            ):
+                button = self._role_button(
+                    team_name,
+                    role_name,
+                    callback,
+                    height=button_height,
+                )
+                buttons[(team_name, role_name)] = button
+                grid.add_widget(button)
+
+            container.add_widget(grid)
+            used_height = grid.height
+
+        no_role_height = dp(32) if compact else dp(36)
+
+        no_role = self._role_button(
+            None,
+            None,
+            callback,
+            height=no_role_height,
+            text=f"[b]{i18n.t('NO ROLE')}[/b]",
+            tone=None,
+        )
+        buttons[(None, None)] = no_role
+        container.add_widget(no_role)
+
+        self._refresh_role_buttons(buttons, team, role)
+
+        return used_height + no_role_height + dp(6)
 
     # HOST ROLE TEXT
     def get_host_role_text(self):
+        team = self.host_team
+        role = self.host_role
 
-        return (
-            f"HOST ROLE: "
-            f"{self.host_team.upper()} "
-            f"{self.host_role.upper()}"
+        if not team or not role:
+            return i18n.t("NO ROLE")
+
+        team_text = (
+            i18n.t("SHARED")
+            if team == SHARED_TEAM
+            else i18n.t(str(team).upper())
         )
+
+        return i18n.t(
+            "HOST ROLE: {team} {role}",
+            team=team_text,
+            role=i18n.t(str(role).upper()),
+        )
+
+    def _assignment_sentence(self, team, role):
+        if not team or not role:
+            return i18n.t("No role selected.")
+
+        team_text = (
+            i18n.t("SHARED")
+            if team == SHARED_TEAM
+            else i18n.t(str(team).upper())
+        )
+
+        return i18n.t(
+            "You are now {team} {role}.",
+            team=team_text,
+            role=i18n.t(str(role).upper()),
+        )
+
     # HOST: PICK OWN TEAM AND ROLE
     def choose_host_assignment(self, team, role):
 
         if not self.network_server:
             return
 
-        success = (
-            self.network_server.server.set_host_assignment(
-                team,
-                role
-            )
-        )
+        server = self.network_server.server
+
+        if team is None or role is None:
+            success = server.set_host_assignment(None, None)
+        else:
+            success = server.set_host_assignment(team, role)
 
         if not success:
 
             self.host_status_label.text = (
-                f"{team.upper()} already has a spymaster."
+                i18n.t("That role is already taken.")
+                if role == "spymaster"
+                else i18n.t("No role selected.")
             )
 
-            return
+            return False
 
-        self.host_team = team
-        self.host_role = role
+        self.host_team = server.host_team
+        self.host_role = server.host_role
 
         self._refresh_role_buttons(
             self.host_role_buttons,
-            team,
-            role,
+            self.host_team,
+            self.host_role,
         )
 
         if hasattr(self, "host_role_label"):
             self.host_role_label.text = self.get_host_role_text()
 
         if hasattr(self, "host_status_label"):
-            self.host_status_label.text = (
-                f"You are now {team.upper()} {role.upper()}."
+            self.host_status_label.text = self._assignment_sentence(
+                team, role
             )
 
         self.network_server.send_lobby_update()
+        self.update_host_lobby(0)
+
+        return True
+
+    def set_spymaster_mode(self, mode):
+        """Switch modes; every spymaster assignment is cleared."""
+
+        if not self.network_server:
+            return
+
+        if mode == 1:
+            lobby = self.network_server.server.get_lobby()
+
+            if len(lobby) >= 4:
+                if hasattr(self, "host_status_label"):
+                    self.host_status_label.text = i18n.t(
+                        "Cannot use 1 spymaster with 4 or more players in the lobby."
+                    )
+
+                self.update_host_lobby(0)
+                return
+
+        if not self.network_server.server.set_spymaster_mode(mode):
+            return
+
+        self.spymaster_mode = mode
+        self.host_team = self.network_server.server.host_team
+        self.host_role = self.network_server.server.host_role
+
+        self.network_server.send_lobby_update()
+
+        # Rebuild the picker (the grid shape changes with the mode).
+        self.show_screen(self.create_host_screen, "host")
+
     # UPDATE HOST LOBBY
     def update_host_lobby(self, dt):
 
@@ -1934,8 +2210,9 @@ class CodenamesApp(App):
 
             if event_type == "player_joined":
 
-                self.host_status_label.text = (
-                    f"{event.get('name', 'Player')} joined successfully!"
+                self.host_status_label.text = i18n.t(
+                    "{name} joined successfully!",
+                    name=safe_markup(event.get("name", "Player")),
                 )
 
                 lobby_changed = True
@@ -1946,8 +2223,9 @@ class CodenamesApp(App):
 
             elif event_type == "player_left":
 
-                self.host_status_label.text = (
-                    f"{event.get('name', 'Player')} disconnected."
+                self.host_status_label.text = i18n.t(
+                    "{name} disconnected.",
+                    name=safe_markup(event.get("name", "Player")),
                 )
 
                 lobby_changed = True
@@ -1971,10 +2249,7 @@ class CodenamesApp(App):
                 player_name = event.get("name", "Player")
 
                 requested_team = message.get("team")
-                requested_role = message.get(
-                    "role",
-                    "operative"
-                )
+                requested_role = message.get("role")
 
                 success = (
                     self.network_server.server.set_player_assignment(
@@ -1986,11 +2261,28 @@ class CodenamesApp(App):
 
                 if success:
 
-                    self.host_status_label.text = (
-                        f"{player_name} joined the "
-                        f"{str(requested_team).upper()} team "
-                        f"as {str(requested_role).upper()}."
-                    )
+                    if requested_team and requested_role:
+                        team_text = (
+                            i18n.t("SHARED")
+                            if requested_team == SHARED_TEAM
+                            else i18n.t(
+                                str(requested_team).upper()
+                            )
+                        )
+
+                        self.host_status_label.text = i18n.t(
+                            "{name} joined the {team} team as {role}.",
+                            name=safe_markup(player_name),
+                            team=team_text,
+                            role=i18n.t(
+                                str(requested_role).upper()
+                            ),
+                        )
+                    else:
+                        self.host_status_label.text = i18n.t(
+                            "{name} is picking a role.",
+                            name=safe_markup(player_name),
+                        )
 
                     lobby_changed = True
 
@@ -2000,13 +2292,13 @@ class CodenamesApp(App):
                         player_key,
                         {
                             "type": "selection_rejected",
+                            "reason": (
+                                "role_taken"
+                                if requested_role == "spymaster"
+                                else "invalid_role"
+                            ),
                             "name": player_name,
                             "player_key": player_key,
-                            "message": (
-                                f"{str(requested_team).upper()} "
-                                f"already has a spymaster "
-                                f"(or that role is invalid)."
-                            )
                         }
                     )
 
@@ -2015,34 +2307,30 @@ class CodenamesApp(App):
 
         lobby = self.network_server.server.get_lobby()
 
-        clients = [
-            player
-            for player in lobby
-            if not player.get("is_host")
-        ]
-
-        total_players = len(clients) + 1  # +1 for the host
+        total_players = len(lobby)
+        min_players = 3 if self.spymaster_mode == 1 else 4
 
         # ---------------------------------------------------------
         # UPDATE HOST LOBBY DISPLAY
         # ---------------------------------------------------------
 
         lines = [
-            f"[color=#{'8B96A8'}]PLAYERS · "
-            f"{total_players}/{MIN_PLAYERS} READY[/color]"
+            "[color=#8B96A8]"
+            + i18n.t(
+                "PLAYERS · {count}/{minimum} READY",
+                count=total_players,
+                minimum=min_players,
+            )
+            + "[/color]"
         ]
 
         for player in lobby:
 
             name = safe_markup(player.get("name", "Player"))
             team = player.get("team")
+            role = player.get("role")
 
             dot = TEAM_HEX.get(team, "5C6675")
-            role_text = str(
-                player.get("role", "operative")
-            ).upper()
-
-            tag_colour = TEAM_HEX.get(team, "8B96A8")
 
             line = (
                 f"[color=#{dot}]•[/color]  [b]{name}[/b]"
@@ -2050,17 +2338,31 @@ class CodenamesApp(App):
 
             if player.get("is_host"):
                 line += (
-                    "   [color=#2DD4BF][size=10]HOST[/size][/color]"
+                    "   [color=#2DD4BF][size=10]"
+                    f"{i18n.t('HOST')}[/size][/color]"
                 )
 
-            if team:
+            if team and role:
+                tag_colour = (
+                    "8B96A8"
+                    if team == SHARED_TEAM
+                    else TEAM_HEX.get(team, "8B96A8")
+                )
+                team_text = (
+                    i18n.t("SHARED")
+                    if team == SHARED_TEAM
+                    else i18n.t(str(team).upper())
+                )
+
                 line += (
                     f"   [color=#{tag_colour}][size=10]"
-                    f"{str(team).upper()} {role_text}[/size][/color]"
+                    f"{team_text} {i18n.t(str(role).upper())}"
+                    "[/size][/color]"
                 )
             else:
                 line += (
-                    "   [color=#5C6675][size=10]NO TEAM[/size][/color]"
+                    "   [color=#5C6675][size=10]"
+                    f"{i18n.t('NO ROLE')}[/size][/color]"
                 )
 
             lines.append(line)
@@ -2069,41 +2371,13 @@ class CodenamesApp(App):
         # ROLE LAYOUT HINTS (do not block starting)
         # ---------------------------------------------------------
 
-        hints = []
+        blocker = self._lobby_blocker(lobby)
 
-        for team in ("red", "blue"):
-
-            members = [
-                player
-                for player in lobby
-                if player.get("team") == team
-            ]
-
-            if not members:
-                continue
-
-            if not any(
-                player.get("role") == "spymaster"
-                for player in members
-            ):
-                hints.append(
-                    f"{team.upper()} has no spymaster."
-                )
-
-            if not any(
-                player.get("role") == "operative"
-                for player in members
-            ):
-                hints.append(
-                    f"{team.upper()} has no operative."
-                )
-
-        if hints:
+        if blocker is not None and total_players >= min_players:
             lines.append("")
-            for hint in hints:
-                lines.append(
-                    f"[color=#8B96A8]{safe_markup(hint)}[/color]"
-                )
+            lines.append(
+                f"[color=#8B96A8]{safe_markup(blocker)}[/color]"
+            )
 
         self.host_players_label.text = "\n".join(lines)
 
@@ -2111,37 +2385,86 @@ class CodenamesApp(App):
         # CAN THE HOST START?
         # ---------------------------------------------------------
 
-        players_ready = (
-            total_players >= MIN_PLAYERS
-            and all(
-                player.get("team") in ("red", "blue")
-                for player in clients
-            )
-        )
+        if hasattr(self, "host_mode_buttons"):
+            one_spymaster = self.host_mode_buttons.get(1)
+
+            if one_spymaster is not None:
+                one_spymaster.disabled = (
+                    self.spymaster_mode != 1 and total_players >= 4
+                )
 
         if self.start_match_button:
 
-            self.start_match_button.disabled = (
-                not players_ready
-            )
+            self.start_match_button.disabled = blocker is not None
 
-            if players_ready:
+            if blocker is None:
+                self.start_match_button.text = i18n.t("START GAME")
 
-                self.start_match_button.text = "START GAME"
-
-            else:
-
-                self.start_match_button.text = (
-                    f"START GAME "
-                    f"({total_players}/{MIN_PLAYERS} PLAYERS)"
+            elif total_players < min_players:
+                self.start_match_button.text = i18n.t(
+                    "START GAME ({count}/{minimum} PLAYERS)",
+                    count=total_players,
+                    minimum=min_players,
                 )
 
+            else:
+                self.start_match_button.text = blocker
+
         return True
-    # OPEN JOIN SCREEN
+    # -----------------------------------------------------------------
+    # MODAL OVERLAY
+    # -----------------------------------------------------------------
+
+    def _open_overlay(self, panel):
+        if self._overlay_root is not None:
+            self._close_overlay()
+
+        container = FloatLayout()
+
+        # `children` is stored newest-first and restored as-is on close.
+        original = list(self.root.children)
+
+        for child in original:
+            self.root.remove_widget(child)
+            container.add_widget(child)
+
+        container.add_widget(Scrim())
+
+        container.add_widget(self._centered_scroll(panel, margin=dp(10)))
+
+        container.original_children = original
+        self._overlay_root = container
+        self.root.add_widget(container)
+
+    def _close_overlay(self, instance=None, rebuild=True):
+        container = self._overlay_root
+
+        if container is None:
+            return
+
+        self._overlay_root = None
+
+        if rebuild:
+            builder = getattr(self, "_screen_builder", None)
+
+            self.root.clear_widgets()
+            self.root.add_widget(
+                builder() if builder else self.create_menu()
+            )
+
+            return
+
+        # Keep the underlying screen: unwrap the float layer again so
+        # the next overlay does not stack on a stale container.
+        original = list(getattr(container, "original_children", []))
+
+        self.root.clear_widgets()
+        self.root.children = original
+
+        # OPEN JOIN SCREEN
     def show_join_screen(self, instance):
 
         self.cleanup_network()
-        self._manual_join_open = False
         self.join_lobbies = []
 
         self.show_screen(self.create_join_screen, "join")
@@ -2162,9 +2485,9 @@ class CodenamesApp(App):
 
         # The desktop fallback adds the manual address block below.
         base_height = (
-            dp(556 if android else 690)
+            dp(500 if android else 634)
             if compact
-            else dp(596 if android else 726)
+            else dp(536 if android else 666)
         )
 
         card = Panel(
@@ -2225,22 +2548,6 @@ class CodenamesApp(App):
 
         card.add_widget(
             self._label(
-                "PLAYER NAME",
-                dp(10),
-                MUTED,
-                bold=True,
-                height=dp(14),
-            )
-        )
-
-        self.join_name_input = FlatInput(
-            hint_text="Enter your name",
-            height=dp(42) if compact else dp(46),
-        )
-        card.add_widget(self.join_name_input)
-
-        card.add_widget(
-            self._label(
                 "LOBBIES ON THIS NETWORK",
                 dp(10),
                 MUTED,
@@ -2285,16 +2592,7 @@ class CodenamesApp(App):
         )
         refresh_button.bind(on_press=self.refresh_lobbies_now)
 
-        scan_button = FlatButton(
-            text="SCAN QR",
-            variant="ghost",
-            font_size=dp(11) if compact else dp(12),
-            size_hint=(1, 1),
-        )
-        scan_button.bind(on_press=self.scan_to_join)
-
         action_row.add_widget(refresh_button)
-        action_row.add_widget(scan_button)
         card.add_widget(action_row)
 
         self.join_status_label = self._label(
@@ -2414,7 +2712,7 @@ class CodenamesApp(App):
             and not self.join_lobbies
             and self._join_notice is None
         ):
-            self.lobby_status_label.text = (
+            self.lobby_status_label.text = i18n.t(
                 "Searching for hosts on this network..."
             )
 
@@ -2459,15 +2757,14 @@ class CodenamesApp(App):
         count = len(self.join_lobbies)
 
         if count == 0:
-            self.lobby_status_label.text = (
+            self.lobby_status_label.text = i18n.t(
                 "No host yet. Both phones must be on the same "
                 "Wi-Fi or hotspot."
             )
-        elif count == 1:
-            self.lobby_status_label.text = "1 host found. Tap JOIN."
         else:
-            self.lobby_status_label.text = (
-                f"{count} hosts found. Tap JOIN."
+            self.lobby_status_label.text = i18n.t(
+                "{count} hosts found. Tap JOIN.",
+                count=count,
             )
 
     def _render_lobbies(self, hosts):
@@ -2516,9 +2813,17 @@ class CodenamesApp(App):
 
         labels = BoxLayout(orientation="vertical", spacing=0)
 
+        title = str(host.get("host_name") or "").strip()
+
+        if not title:
+            title = str(host.get("ssid") or "").strip()
+
+        if not title:
+            title = i18n.t("Codenames host")
+
         labels.add_widget(
             self._label(
-                host.get("ssid") or "Codenames host",
+                title,
                 dp(12) if compact else dp(13),
                 TEXT,
                 bold=True,
@@ -2528,11 +2833,10 @@ class CodenamesApp(App):
         )
 
         players = int(host.get("players") or 1)
-        kind = str(host.get("kind") or "WI-FI")
 
         labels.add_widget(
             self._label(
-                f"{players} player{'s' if players != 1 else ''} · {kind}",
+                i18n.t("{players} players", players=players),
                 dp(9) if compact else dp(10),
                 MUTED,
                 height=dp(14),
@@ -2562,166 +2866,57 @@ class CodenamesApp(App):
         if not host:
             return
 
-        name = (
-            self.join_name_input.text.strip() or "Player"
-        )[:20]
-
-        port = host.get("port")
-
         try:
-            port = int(port)
+            port = int(host.get("port"))
 
         except (TypeError, ValueError):
             port = PORT
 
-        self.client_name = name
-        self.scanned_ssid = str(host.get("ssid") or "")
+        self.client_name = self.player_name
 
-        self._connect_to_host(host.get("host"), port, name)
+        self._connect_to_host(host.get("host"), port, self.player_name)
 
-    # CONNECT: DISCOVERY, QR OR MANUAL
-    def scan_to_join(self, instance=None):
-        if not is_scan_supported():
-            self.join_status_label.text = (
-                "QR scanning is available in the Android app."
-            )
-            return
+    # -----------------------------------------------------------------
+    # MANUAL ADDRESS FALLBACK
+    # -----------------------------------------------------------------
 
-        self.join_status_label.text = "Opening the camera..."
+    @staticmethod
+    def parse_address(text):
+        """Turn `192.168.1.5:5000` (or just a host) into (host, port)."""
 
-        started = scan_qr_code(
-            self._handle_scan_result,
-            self._handle_scan_error,
-        )
+        raw = str(text or "").strip()
 
-        if not started:
-            self.join_status_label.text = (
-                "Could not open the camera. Pick a lobby above, or "
-                "allow the camera in Settings."
-            )
+        if not raw:
+            return None
 
-    def _handle_scan_error(self, reason):
-        label = getattr(self, "join_status_label", None)
+        raw = raw.replace("codenames://", "", 1).strip().strip("/")
 
-        if reason == "permission":
+        if "/" in raw:
+            raw = raw.split("/", 1)[0]
 
-            if label is not None:
-                label.text = (
-                    "Camera permission is blocked. Allow it in "
-                    "Settings, then scan again."
-                )
+        if "@" in raw:
+            raw = raw.rsplit("@", 1)[-1]
 
-            self.show_camera_help()
+        port = PORT
 
-            return
+        if ":" in raw:
+            host, _, port_text = raw.rpartition(":")
 
-        if label is not None:
-            label.text = (
-                "The QR scanner could not start on this phone."
-            )
+            try:
+                port = int(port_text)
 
-    def show_camera_help(self):
-        """Explain how to re-enable the camera after a denial."""
+            except ValueError:
+                return None
 
-        panel = Panel(
-            orientation="vertical",
-            size_hint=(None, None),
-            width=self._clamp_width(dp(330)),
-            height=dp(268),
-            padding=[dp(20), dp(18), dp(20), dp(18)],
-            spacing=dp(10),
-        )
+        else:
+            host = raw
 
-        panel.add_widget(
-            self._label(
-                "CAMERA BLOCKED",
-                dp(10),
-                RED,
-                bold=True,
-                halign="center",
-                height=dp(14),
-            )
-        )
-        panel.add_widget(
-            self._label(
-                "The QR scanner needs the camera permission.",
-                dp(12),
-                TEXT,
-                halign="center",
-                height=dp(40),
-            )
-        )
-        panel.add_widget(
-            self._label(
-                "Settings > Apps > Codenames > Permissions > Camera",
-                dp(10),
-                MUTED,
-                halign="center",
-                height=dp(48),
-            )
-        )
+        host = host.strip()
 
-        row = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=dp(44),
-            spacing=dp(8),
-        )
+        if not host:
+            return None
 
-        settings_button = FlatButton(
-            text="OPEN SETTINGS",
-            variant="primary",
-            font_size=dp(11),
-            size_hint=(1, 1),
-        )
-        settings_button.bind(
-            on_press=lambda instance: (
-                platform_utils.open_app_settings()
-            )
-        )
-
-        close_button = FlatButton(
-            text="CLOSE",
-            variant="ghost",
-            font_size=dp(11),
-            size_hint=(1, 1),
-        )
-        close_button.bind(on_press=self._close_overlay)
-
-        row.add_widget(settings_button)
-        row.add_widget(close_button)
-        panel.add_widget(row)
-
-        self._open_overlay(panel)
-
-    def _handle_scan_result(self, data):
-        if not data:
-            self.join_status_label.text = "Scan cancelled."
-            return
-
-        payload = parse_join_payload(data)
-
-        if payload is None:
-            self.join_status_label.text = (
-                "That QR code is not a Codenames invite."
-            )
-            return
-
-        self._last_scan_payload = payload
-        self.scanned_ssid = payload.get("ssid", "")
-
-        name = (
-            self.join_name_input.text.strip() or "Player"
-        )[:20]
-        self.client_name = name
-
-        self.join_status_label.text = "QR read. Connecting..."
-
-        self._connect_to_host(
-            payload["host"],
-            payload["port"],
-            name,
-        )
+        return host, port
 
     def connect_to_host(self, instance=None):
         """Desktop-only manual address fallback."""
@@ -2731,32 +2926,23 @@ class CodenamesApp(App):
 
         raw = self.join_ip_input.text.strip()
 
-        player_name = (
-            self.join_name_input.text.strip() or "Player"
-        )[:20]
-        self.client_name = player_name
+        self.client_name = self.player_name
 
         if not raw:
-            self.join_status_label.text = (
+            self.join_status_label.text = i18n.t(
                 "Please enter the host address."
             )
             return
 
-        payload = parse_join_payload(raw)
+        parsed = self.parse_address(raw)
 
-        if payload is None:
-            self.join_status_label.text = (
+        if parsed is None:
+            self.join_status_label.text = i18n.t(
                 "Use an address like 192.168.1.5:5000."
             )
             return
 
-        self.scanned_ssid = payload.get("ssid", "")
-
-        self._connect_to_host(
-            payload["host"],
-            payload["port"],
-            player_name,
-        )
+        self._connect_to_host(parsed[0], parsed[1], self.player_name)
 
     def _drop_client(self):
         """Close the client socket and stop polling it (safe to repeat)."""
@@ -2786,7 +2972,7 @@ class CodenamesApp(App):
 
         self.network_client = GameClient()
 
-        self.join_status_label.text = "Connecting..."
+        self.join_status_label.text = i18n.t("Connecting...")
 
         self.network_client.connect(
             host,
@@ -2910,13 +3096,18 @@ class CodenamesApp(App):
             if 0 <= index < len(getattr(self, "client_words", [])):
                 word = self.client_words[index]
 
-            guesser = event.get("guesser") or "Player"
+            guesser = event.get("guesser") or i18n.t("Player")
 
             self.add_log(
-                f"{safe_markup(guesser)} guessed "
-                f"[b]{safe_markup(word)}[/b] · "
-                f"[color=#{TEAM_HEX.get(role, '8B96A8')}]"
-                f"{role.upper()}[/color]",
+                i18n.t(
+                    "{name} guessed {word} · {team}",
+                    name=safe_markup(guesser),
+                    word=f"[b]{safe_markup(word)}[/b]",
+                    team=(
+                        f"[color=#{TEAM_HEX.get(role, '8B96A8')}]"
+                        f"{i18n.t(str(role).upper())}[/color]"
+                    ),
+                ),
                 role,
             )
 
@@ -2954,7 +3145,8 @@ class CodenamesApp(App):
         if self.client_game_over:
 
             self.end_game(
-                event.get("message", "GAME OVER")
+                event.get("winner", "red"),
+                event.get("reason", "words"),
             )
     # HOST PERMISSION FUNCTION
     def update_host_controls(self):
@@ -2998,8 +3190,8 @@ class CodenamesApp(App):
                 "CODENAMES",
                 self.client_remaining,
                 "LEAVE",
-                self.return_to_menu,
-                badge_text=self.client_team.upper(),
+                self.confirm_leave_match,
+                badge_text=str(self.client_team or "").upper(),
                 badge_team=self.client_team,
             )
         )
@@ -3120,7 +3312,7 @@ class CodenamesApp(App):
             return
 
         if self.network_client is None:
-            self.client_info_label.text = "No connection to the host."
+            self.client_info_label.text = i18n.t("No connection to the host.")
             return
 
         success = self.network_client.send_message({
@@ -3135,9 +3327,7 @@ class CodenamesApp(App):
 
         else:
 
-            self.client_info_label.text = (
-                "Could not contact host."
-            )
+            self.client_info_label.text = i18n.t("Could not contact host.")
     # CLIENT: END TURN
     def client_end_turn(self, instance):
 
@@ -3154,7 +3344,7 @@ class CodenamesApp(App):
             return
 
         if self.network_client is None:
-            self.client_info_label.text = "No connection to the host."
+            self.client_info_label.text = i18n.t("No connection to the host.")
             return
 
         success = self.network_client.send_message({
@@ -3205,16 +3395,33 @@ class CodenamesApp(App):
             )
         )
 
-        team = (self.client_team or "none").upper()
-        role = self.client_role.upper()
-        team_hex = TEAM_HEX.get(self.client_team, "8B96A8")
+        team = self.client_team
+        role = self.client_role
+        team_hex = (
+            "8B96A8"
+            if team == SHARED_TEAM
+            else TEAM_HEX.get(team, "8B96A8")
+        )
+
+        if team and role:
+            team_text = (
+                i18n.t("SHARED")
+                if team == SHARED_TEAM
+                else i18n.t(str(team).upper())
+            )
+            role_text = i18n.t(str(role).upper())
+        else:
+            team_text = i18n.t("NONE")
+            role_text = i18n.t("NO ROLE")
 
         self.client_role_label = Label(
             text=(
-                "[size=10][color=#8B96A8]YOUR TEAM[/color][/size]\n"
-                f"[color=#{team_hex}][b]{team}[/b][/color]\n"
-                "[size=10][color=#8B96A8]YOUR ROLE[/color][/size]\n"
-                f"[b]{role}[/b]"
+                "[size=10][color=#8B96A8]"
+                f"{i18n.t('YOUR TEAM')}[/color][/size]\n"
+                f"[color=#{team_hex}][b]{team_text}[/b][/color]\n"
+                "[size=10][color=#8B96A8]"
+                f"{i18n.t('YOUR ROLE')}[/color][/size]\n"
+                f"[b]{role_text}[/b]"
             ),
             markup=True,
             font_size=dp(14) if compact else dp(16),
@@ -3260,7 +3467,7 @@ class CodenamesApp(App):
             size_hint=(1, None),
             height=dp(40),
         )
-        back_button.bind(on_press=self.return_to_menu)
+        back_button.bind(on_press=self.confirm_leave_lobby)
         card.add_widget(back_button)
 
         root.add_widget(self._centered_scroll(card))
@@ -3276,33 +3483,150 @@ class CodenamesApp(App):
 
             name = safe_markup(player.get("name", "Player"))
             team = player.get("team")
-            role = str(player.get("role", "operative")).upper()
+            role = player.get("role")
 
-            dot = TEAM_HEX.get(team, "5C6675")
-            tag = TEAM_HEX.get(team, "8B96A8")
+            dot = "5C6675" if team == SHARED_TEAM else TEAM_HEX.get(
+                team, "5C6675"
+            )
 
             line = f"[color=#{dot}]•[/color]  [b]{name}[/b]"
 
             if player.get("is_host"):
                 line += (
-                    "   [color=#2DD4BF][size=10]HOST[/size][/color]"
+                    "   [color=#2DD4BF][size=10]"
+                    f"{i18n.t('HOST')}[/size][/color]"
                 )
 
-            if team:
+            if team and role:
+                tag = (
+                    "8B96A8"
+                    if team == SHARED_TEAM
+                    else TEAM_HEX.get(team, "8B96A8")
+                )
+                team_text = (
+                    i18n.t("SHARED")
+                    if team == SHARED_TEAM
+                    else i18n.t(str(team).upper())
+                )
+
                 line += (
                     f"   [color=#{tag}][size=10]"
-                    f"{str(team).upper()} {role}[/size][/color]"
+                    f"{team_text} {i18n.t(str(role).upper())}"
+                    "[/size][/color]"
                 )
             else:
                 line += (
-                    "   [color=#5C6675][size=10]NO TEAM[/size][/color]"
+                    "   [color=#5C6675][size=10]"
+                    f"{i18n.t('NO ROLE')}[/size][/color]"
                 )
 
             lines.append(line)
 
         return "\n".join(lines) if lines else (
-            "[color=#5C6675]No players yet.[/color]"
+            f"[color=#5C6675]{i18n.t('No players yet.')}[/color]"
         )
+
+    def _client_assignment_text(self):
+        team = self.client_team
+        role = self.client_role
+
+        if not team or not role:
+            return i18n.t("No role selected.")
+
+        team_text = (
+            i18n.t("SHARED")
+            if team == SHARED_TEAM
+            else i18n.t(str(team).upper())
+        )
+
+        return i18n.t(
+            "You joined the {team} team as {role}.",
+            team=team_text,
+            role=i18n.t(str(role).upper()),
+        )
+
+    def _refresh_client_role_labels(self):
+        """Update the waiting screen card + lobby chip after a change."""
+
+        if hasattr(self, "client_role_label"):
+            self.client_role_label.text = self._client_lobby_role_markup()
+
+        if hasattr(self, "team_selection_status"):
+            self.team_selection_status.text = (
+                self._client_assignment_text()
+            )
+
+        if hasattr(self, "team_selection_lobby"):
+            self.team_selection_lobby.text = self._client_lobby_markup()
+
+        if hasattr(self, "client_lobby_label"):
+            self.client_lobby_label.text = self._client_lobby_markup()
+
+    def _client_lobby_role_markup(self):
+        team = self.client_team
+        role = self.client_role
+        team_hex = (
+            "8B96A8"
+            if team == SHARED_TEAM
+            else TEAM_HEX.get(team, "8B96A8")
+        )
+
+        if team and role:
+            team_text = (
+                i18n.t("SHARED")
+                if team == SHARED_TEAM
+                else i18n.t(str(team).upper())
+            )
+            role_text = i18n.t(str(role).upper())
+        else:
+            team_text = i18n.t("NONE")
+            role_text = i18n.t("NO ROLE")
+
+        return (
+            "[size=10][color=#8B96A8]"
+            f"{i18n.t('YOUR TEAM')}[/color][/size]\n"
+            f"[color=#{team_hex}][b]{team_text}[/b][/color]\n"
+            "[size=10][color=#8B96A8]"
+            f"{i18n.t('YOUR ROLE')}[/color][/size]\n"
+            f"[b]{role_text}[/b]"
+        )
+
+    def _rejection_text(self, event):
+        """Translate the host's rejection code (language is per device)."""
+
+        reason = str(event.get("reason") or "")
+        team = event.get("current_team") or ""
+
+        if reason == "game_started":
+            return i18n.t("The game has already started.")
+
+        if reason == "game_over":
+            return i18n.t("The game is over.")
+
+        if reason == "not_operative":
+            return i18n.t(
+                "Spymasters cannot reveal cards. "
+                "Give clues to your operatives."
+            )
+
+        if reason == "wrong_turn":
+            return i18n.t(
+                "It's {team}'s turn!",
+                team=i18n.t(str(team).upper()),
+            )
+
+        if reason == "invalid_card":
+            return i18n.t("That card cannot be selected.")
+
+        if reason == "role_taken":
+            return i18n.t("That role is already taken.")
+
+        if reason == "invalid_role":
+            return i18n.t("No role selected.")
+
+        legacy = str(event.get("message") or "")
+
+        return i18n.t(legacy) if legacy else i18n.t("Action rejected.")
     # UPDATE CLIENT STATUS
     def update_client_status(self, dt):
 
@@ -3332,12 +3656,16 @@ class CodenamesApp(App):
 
                 self.client_role = event.get(
                     "role",
-                    "operative"
+                    None
                 )
 
                 self.client_lobby = event.get(
                     "lobby",
                     []
+                )
+
+                self.spymaster_mode = int(
+                    event.get("spymaster_mode", 2)
                 )
 
                 self.show_screen(
@@ -3364,13 +3692,20 @@ class CodenamesApp(App):
 
                     if hasattr(self, "join_status_label"):
 
-                        self.join_status_label.text = (
+                        self.join_status_label.text = i18n.t(
                             "Invalid board received from host."
                         )
 
                     continue
 
                 self.client_words = words
+
+                self.spymaster_mode = int(
+                    event.get(
+                        "spymaster_mode",
+                        self.spymaster_mode,
+                    )
+                )
 
                 self.client_current_team = (
                     event.get("current_team", "red")
@@ -3456,10 +3791,7 @@ class CodenamesApp(App):
 
                 self.update_client_controls()
 
-                message = event.get(
-                    "message",
-                    "Action rejected."
-                )
+                message = self._rejection_text(event)
 
                 if hasattr(self, "client_info_label"):
                     self.client_info_label.text = message
@@ -3469,25 +3801,30 @@ class CodenamesApp(App):
             # CONNECTION ERROR
             elif event_type == "error":
 
-                message = str(event.get("message", ""))
+                reason = str(event.get("reason") or "")
+                message = str(event.get("message") or "")
 
-                if getattr(self, "scanned_ssid", ""):
-                    message += (
-                        f"\nConnect this phone to the "
-                        f"'{self.scanned_ssid}' Wi-Fi/hotspot, "
-                        f"then try again."
+                if not message:
+                    message = i18n.t(
+                        {
+                            "invalid_join": "Could not join that lobby.",
+                        }.get(reason, "Connection error.")
                     )
+
+                message = i18n.t(message)
 
                 if hasattr(self, "join_status_label"):
 
-                    self.join_status_label.text = (
-                        f"COULD NOT CONNECT:\n{message}"
+                    self.join_status_label.text = i18n.t(
+                        "COULD NOT CONNECT:\n{message}",
+                        message=message,
                     )
 
                 if hasattr(self, "client_info_label"):
 
-                    self.client_info_label.text = (
-                        f"Connection error: {message}"
+                    self.client_info_label.text = i18n.t(
+                        "Connection error: {message}",
+                        message=message,
                     )
 
                 # The connection is dead: drop the client so the next
@@ -3499,8 +3836,10 @@ class CodenamesApp(App):
                 # can tap a different host.
                 if self._screen_name == "join":
                     self.start_lobby_scan()
-                elif self._screen_name not in ("menu", "game"):
-                    self._return_to_join("Connection lost.")
+                elif self._screen_name not in ("menu",):
+                    self._return_to_join(
+                        i18n.t("Connection lost.")
+                    )
 
             # DISCONNECTED
             elif event_type == "disconnected":
@@ -3509,30 +3848,43 @@ class CodenamesApp(App):
 
                 self._drop_client()
 
+                host_closed = event.get("reason") == "host_closed"
+
+                notice = (
+                    i18n.t("The host closed the lobby.")
+                    if host_closed
+                    else i18n.t("Disconnected from host.")
+                )
+
                 if hasattr(self, "client_info_label"):
 
-                    self.client_info_label.text = (
-                        "Disconnected from host."
-                    )
+                    self.client_info_label.text = notice
 
                 elif (
                     hasattr(self, "join_status_label")
                     and self._join_notice is None
                 ):
 
-                    self.join_status_label.text = (
-                        "Disconnected from host."
-                    )
+                    self.join_status_label.text = notice
 
                 if self._screen_name == "join":
                     self.start_lobby_scan()
-                elif self._screen_name not in ("menu", "game"):
-                    self._return_to_join("The host closed the lobby.")
+                elif self._screen_name not in ("menu",):
+                    self._return_to_join(notice)
+
+            # HOST SENT A LOBBY UPDATE
             elif event_type == "lobby_update":
 
                 self.client_lobby = event.get(
                     "lobby",
                     []
+                )
+
+                self.spymaster_mode = int(
+                    event.get(
+                        "spymaster_mode",
+                        self.spymaster_mode,
+                    )
                 )
 
                 # Find our own player entry
@@ -3549,33 +3901,36 @@ class CodenamesApp(App):
                         )
 
                         self.client_role = player.get(
-                            "role",
-                            "operative"
+                            "role"
                         )
 
                         break
 
                 self.update_team_selection_lobby()
 
-                if hasattr(
-                    self,
-                    "team_selection_status"
-                ):
+            # HOST SENT EVERYONE BACK TO THE LOBBY
+            elif event_type == "lobby_return":
 
-                    if self.client_team:
+                self.game_over = False
+                self.client_game_over = False
+                self.client_selection_pending = False
+                self._game_over_shown = False
+                self.game_over_root = None
+                self._overlay_root = None
+                self.client_revealed = set()
+                self.client_revealed_roles = {}
+                self.client_cards = []
+                self.spymaster_cards = []
+                self.client_words = []
+                self.client_key_roles = []
+                self.reset_match_log()
 
-                        self.team_selection_status.text = (
-                            f"You joined the "
-                            f"{self.client_team.upper()} team "
-                            f"as "
-                            f"{self.client_role.upper()}."
-                        )
+                self.show_screen(
+                    self.create_team_selection_screen,
+                    "team_selection",
+                )
 
-                    else:
-
-                        self.team_selection_status.text = (
-                            "No team selected."
-                        )
+                self.update_team_selection_lobby()
 
         return True
     # CLIENT: RECEIVE THE SPYMASTER KEY
@@ -3633,23 +3988,30 @@ class CodenamesApp(App):
         if hasattr(self, "client_info_label"):
 
             if self.client_game_over:
-                self.client_info_label.text = "GAME OVER"
+                self.client_info_label.text = i18n.t("GAME OVER")
 
             elif self.client_role != "operative":
-                self.client_info_label.text = (
+                self.client_info_label.text = i18n.t(
                     "Spymaster: watch the board and give clues."
                 )
 
             elif self.client_selection_pending:
-                self.client_info_label.text = "Waiting for host..."
+                self.client_info_label.text = i18n.t(
+                    "Waiting for host..."
+                )
 
             elif not can_play:
-                self.client_info_label.text = (
-                    f"Waiting for {self.client_current_team.upper()} team..."
+                self.client_info_label.text = i18n.t(
+                    "Waiting for {team} team...",
+                    team=i18n.t(
+                        str(self.client_current_team).upper()
+                    ),
                 )
 
             else:
-                self.client_info_label.text = "Your team's turn!"
+                self.client_info_label.text = i18n.t(
+                    "Your team's turn!"
+                )
     # CLEANUP NETWORK CONNECTIONS
     def cleanup_network(self):
 
@@ -3718,8 +4080,8 @@ class CodenamesApp(App):
             self._build_top_bar(
                 "SPYMASTER",
                 remaining,
-                "LEAVE" if for_client else "MENU",
-                self.return_to_menu,
+                "LEAVE" if for_client else "LOBBY",
+                self.confirm_leave_match,
                 badge_text=str(team or "").upper(),
                 badge_team=team,
             )
@@ -3904,9 +4266,9 @@ class CodenamesApp(App):
             self._build_top_bar(
                 "CODENAMES",
                 self.remaining,
-                "MENU",
-                self.return_to_menu,
-                badge_text=self.host_team.upper(),
+                "LOBBY",
+                self.confirm_leave_match,
+                badge_text=str(self.host_team or "").upper(),
                 badge_team=self.host_team,
             )
         )
@@ -4055,10 +4417,15 @@ class CodenamesApp(App):
         # Log the guess before a possible turn change is logged.
         if guesser:
             self.add_log(
-                f"{safe_markup(guesser)} guessed "
-                f"[b]{safe_markup(word)}[/b] · "
-                f"[color=#{TEAM_HEX.get(role, '8B96A8')}]"
-                f"{role.upper()}[/color]",
+                i18n.t(
+                    "{name} guessed {word} · {team}",
+                    name=safe_markup(guesser),
+                    word=f"[b]{safe_markup(word)}[/b]",
+                    team=(
+                        f"[color=#{TEAM_HEX.get(role, '8B96A8')}]"
+                        f"{i18n.t(str(role).upper())}[/color]"
+                    ),
+                ),
                 role,
             )
 
@@ -4077,7 +4444,7 @@ class CodenamesApp(App):
 
             if self.remaining["red"] <= 0:
 
-                game_message = "RED TEAM WINS!"
+                game_message = ("red", "words")
 
             elif self.current_team != "red":
 
@@ -4090,7 +4457,7 @@ class CodenamesApp(App):
 
             if self.remaining["blue"] <= 0:
 
-                game_message = "BLUE TEAM WINS!"
+                game_message = ("blue", "words")
 
             elif self.current_team != "blue":
 
@@ -4104,17 +4471,11 @@ class CodenamesApp(App):
         # ASSASSIN
         elif role == "assassin":
 
-            if self.current_team == "red":
-
-                game_message = (
-                    "ASSASSIN!\nBLUE TEAM WINS!"
-                )
-
-            else:
-
-                game_message = (
-                    "ASSASSIN!\nRED TEAM WINS!"
-                )
+            game_message = (
+                ("blue", "assassin")
+                if self.current_team == "red"
+                else ("red", "assassin")
+            )
 
         # UPDATE HOST DISPLAY
         self.mark_spymaster_reveal(index)
@@ -4129,16 +4490,17 @@ class CodenamesApp(App):
                 "type": "card_revealed",
                 "index": index,
                 "role": role,
-                "guesser": guesser or "Player",
+                "guesser": guesser or i18n.t("Player"),
                 "remaining": dict(self.remaining),
                 "current_team": self.current_team,
                 "game_over": game_message is not None,
-                "message": game_message
             }
 
             # At the end the full key is public so every screen can
             # reveal the remaining cards.
             if game_message:
+                payload["winner"] = game_message[0]
+                payload["reason"] = game_message[1]
                 payload["roles"] = list(self.roles)
 
             self.network_server.broadcast(payload)
@@ -4146,7 +4508,7 @@ class CodenamesApp(App):
         # FINISH GAME AFTER BROADCASTING THE RESULT
         if game_message:
 
-            self.end_game(game_message)
+            self.end_game(*game_message)
 
         return True
     # UPDATE HOST SCORES
@@ -4201,22 +4563,22 @@ class CodenamesApp(App):
             # SEND A PRIVATE REJECTION
             # -------------------------------------------------
 
-            def reject(reason):
+            def reject(reason, **extra):
 
-                self.network_server.send_to_player(
-                    sender_key,
-                    {
-                        "type": "selection_rejected",
-                        "name": sender_name,
-                        "player_key": sender_key,
-                        "message": reason
-                    }
-                )
+                payload = {
+                    "type": "selection_rejected",
+                    "name": sender_name,
+                    "player_key": sender_key,
+                    "reason": reason,
+                }
+                payload.update(extra)
+
+                self.network_server.send_to_player(sender_key, payload)
 
             # TEAMS AND ROLES ARE LOCKED ONCE THE GAME STARTS
             if message_type == "choose_team":
 
-                reject("The game has already started.")
+                reject("game_started")
                 continue
 
             if message_type not in ("reveal_card", "end_turn"):
@@ -4224,16 +4586,13 @@ class CodenamesApp(App):
 
             if self.game_over:
 
-                reject("The game is over.")
+                reject("game_over")
                 continue
 
             # Only operatives touch the cards
             if sender_role != "operative":
 
-                reject(
-                    "Spymasters cannot reveal cards. "
-                    "Give clues to your operatives."
-                )
+                reject("not_operative")
 
                 continue
 
@@ -4241,7 +4600,8 @@ class CodenamesApp(App):
             if sender_team != self.current_team:
 
                 reject(
-                    f"It's {self.current_team.upper()}'s turn!"
+                    "wrong_turn",
+                    current_team=self.current_team,
                 )
 
                 continue
@@ -4253,7 +4613,7 @@ class CodenamesApp(App):
 
                 if not self.reveal_card(index, guesser=sender_name):
 
-                    reject("That card cannot be selected.")
+                    reject("invalid_card")
 
             # END TURN
             else:
@@ -4265,10 +4625,40 @@ class CodenamesApp(App):
     def update_team_selection_lobby(self):
 
         if hasattr(self, "team_selection_lobby"):
-
             self.team_selection_lobby.text = (
                 self._client_lobby_markup()
             )
+
+        self._refresh_client_role_labels()
+
+        # The host may switch the spymaster mode while we sit in the
+        # lobby; rebuild the picker so the grid always matches.
+        buttons = getattr(self, "team_buttons", None)
+
+        if buttons is not None and hasattr(self, "team_selection_hint"):
+            expected = set()
+
+            if self.spymaster_mode == 1:
+                expected = {
+                    (SHARED_TEAM, "spymaster"),
+                    ("red", "operative"),
+                    ("blue", "operative"),
+                    (None, None),
+                }
+            else:
+                expected = {
+                    ("red", "spymaster"),
+                    ("red", "operative"),
+                    ("blue", "spymaster"),
+                    ("blue", "operative"),
+                    (None, None),
+                }
+
+            if set(buttons) != expected:
+                self.show_screen(
+                    self.create_team_selection_screen,
+                    "team_selection",
+                )
     # TEAM SELECTION
     def create_team_selection_screen(self):
 
@@ -4316,7 +4706,7 @@ class CodenamesApp(App):
             size_hint=(None, 1),
             width=dp(82) if compact else dp(130),
         )
-        leave_button.bind(on_press=self.return_to_menu)
+        leave_button.bind(on_press=self.confirm_leave_lobby)
 
         header.add_widget(titles)
         header.add_widget(leave_button)
@@ -4352,7 +4742,7 @@ class CodenamesApp(App):
 
         self.team_selection_label = Label(
             text=(
-                f"[color=#8B96A8][size=11]PLAYER[/size][/color]  "
+                f"[color=#8B96A8][size=11]{i18n.t('PLAYER')}[/size][/color]  "
                 f"[b]{safe_markup(self.client_name)}[/b]"
             ),
             markup=True,
@@ -4370,15 +4760,19 @@ class CodenamesApp(App):
         )
         left.add_widget(self.team_selection_label)
 
-        left.add_widget(
-            self._label(
-                "Each team has one spymaster (sees the key) and any "
-                "number of operatives (pick cards).",
-                dp(11) if compact else dp(12),
-                MUTED,
-                height=dp(32) if compact else dp(36),
-            )
+        self.team_selection_hint = self._label(
+            (
+                "One shared spymaster sees the key for both teams; "
+                "everyone else is an operative."
+                if self.spymaster_mode == 1
+                else "Each team has one spymaster (sees the key) and "
+                "any number of operatives (pick cards)."
+            ),
+            dp(11) if compact else dp(12),
+            MUTED,
+            height=dp(32) if compact else dp(36),
         )
+        left.add_widget(self.team_selection_hint)
 
         left.add_widget(
             self._label(
@@ -4390,49 +4784,27 @@ class CodenamesApp(App):
             )
         )
 
-        assignment_grid = GridLayout(
-            cols=2,
-            rows=2,
-            spacing=dp(6) if compact else dp(8),
-            size_hint=(1, None),
-            height=dp(104) if compact else dp(126),
-        )
-
         self.team_buttons = {}
-        assignments = (
-            ("red", "spymaster"),
-            ("red", "operative"),
-            ("blue", "spymaster"),
-            ("blue", "operative"),
+
+        role_box = BoxLayout(
+            orientation="vertical",
+            size_hint=(1, None),
+            spacing=dp(6) if compact else dp(8),
         )
 
-        for team, role in assignments:
-
-            button = self._role_button(
-                team,
-                role,
-                self.select_team,
-                height=dp(49) if compact else dp(59),
-            )
-
-            self.team_buttons[(team, role)] = button
-            assignment_grid.add_widget(button)
-
-        self._refresh_role_buttons(
+        role_box.height = self._fill_role_picker(
+            role_box,
+            compact,
             self.team_buttons,
+            self.select_team,
             self.client_team,
             self.client_role,
         )
 
-        left.add_widget(assignment_grid)
+        left.add_widget(role_box)
 
         self.team_selection_status = self._label(
-            (
-                f"You joined the {self.client_team.upper()} team "
-                f"as {self.client_role.upper()}."
-                if self.client_team
-                else "No team selected."
-            ),
+            self._client_assignment_text(),
             dp(11) if compact else dp(12),
             MUTED,
             shorten=True,
@@ -4497,6 +4869,22 @@ class CodenamesApp(App):
 
         if success:
 
+            if team is None or role is None:
+                self.client_team = None
+                self.client_role = None
+
+                if hasattr(self, "team_buttons"):
+                    self._refresh_role_buttons(
+                        self.team_buttons, None, None
+                    )
+
+                if hasattr(self, "team_selection_status"):
+                    self.team_selection_status.text = i18n.t(
+                        "No role selected."
+                    )
+
+                return
+
             if hasattr(self, "team_buttons"):
                 self._refresh_role_buttons(
                     self.team_buttons,
@@ -4506,16 +4894,23 @@ class CodenamesApp(App):
 
             if hasattr(self, "team_selection_status"):
 
-                self.team_selection_status.text = (
-                    f"Requesting {team.upper()} "
-                    f"{role.upper()}..."
+                team_text = (
+                    i18n.t("SHARED")
+                    if team == SHARED_TEAM
+                    else i18n.t(str(team).upper())
+                )
+
+                self.team_selection_status.text = i18n.t(
+                    "Requesting {team} {role}...",
+                    team=team_text,
+                    role=i18n.t(str(role).upper()),
                 )
 
         else:
 
             if hasattr(self, "team_selection_status"):
 
-                self.team_selection_status.text = (
+                self.team_selection_status.text = i18n.t(
                     "Could not contact host."
                 )
     # SWITCH TURN
@@ -4600,7 +4995,9 @@ class CodenamesApp(App):
                 card.mark_revealed()
 
     # END GAME
-    def end_game(self, message):
+    def end_game(self, winner="red", reason="words"):
+
+        winner = "blue" if winner == "blue" else "red"
 
         self.game_over = True
 
@@ -4615,23 +5012,25 @@ class CodenamesApp(App):
 
         self._game_over_shown = True
 
-        upper = str(message).upper()
-
-        winner = "blue" if "BLUE" in upper else "red"
         winner_colour = TEAM_COLORS.get(winner, TEXT)
-        is_assassin = "ASSASSIN" in upper
 
-        title_text = (
-            "ASSASSIN!"
-            if is_assassin
-            else f"{winner.upper()} TEAM WINS"
+        is_assassin = reason == "assassin"
+
+        title_text = i18n.t(
+            "{team} TEAM WINS",
+            team=i18n.t(winner.upper()),
         )
 
-        detail_text = (
-            "The assassin ended the match."
-            if is_assassin
-            else f"{winner.upper()} revealed all of its words."
-        )
+        if is_assassin:
+            detail_text = i18n.t(
+                "{team} wins because the other team found the assassin.",
+                team=i18n.t(winner.upper()),
+            )
+        else:
+            detail_text = i18n.t(
+                "{team} revealed all of its words.",
+                team=i18n.t(winner.upper()),
+            )
 
         # Move the live screen into a float container so the scrim and
         # result panel can sit on top of it.
@@ -4721,15 +5120,15 @@ class CodenamesApp(App):
 
         panel.add_widget(Widget(size_hint_y=None, height=dp(4)))
 
-        menu_button = FlatButton(
-            text="BACK TO MENU",
+        lobby_button = FlatButton(
+            text="BACK TO LOBBY",
             variant="primary",
             font_size=dp(13) if compact else dp(14),
             size_hint=(1, None),
             height=dp(46) if compact else dp(50),
         )
-        menu_button.bind(on_press=self.return_to_menu)
-        panel.add_widget(menu_button)
+        lobby_button.bind(on_press=self.return_to_lobby)
+        panel.add_widget(lobby_button)
 
         anchor.add_widget(panel)
         container.add_widget(anchor)
@@ -4799,43 +5198,145 @@ class CodenamesApp(App):
         )
 
         rules = ScrollLabel(font_size=dp(12) if compact else dp(14))
-        rules.text = (
-            "[b][color=#2DD4BF]OBJECTIVE[/color][/b]\n"
-            "Two teams race to find all of their words first.\n\n"
-
-            "[b][color=#2DD4BF]THE BOARD[/color][/b]\n"
-            "The board holds 25 random words. Each word secretly "
-            "belongs to one of four categories:\n"
-            "[color=#E14B4B]● RED[/color] — a Red Team word\n"
-            "[color=#4C8DF6]● BLUE[/color] — a Blue Team word\n"
-            "[color=#8B96A8]● NEUTRAL[/color] — belongs to neither team\n"
-            "[color=#C05A5A]● ASSASSIN[/color] — picking it loses the game\n\n"
-
-            "[b][color=#2DD4BF]ROLES[/color][/b]\n"
-            "[b]SPYMASTER[/b] — sees the secret key and gives clues "
-            "verbally. Spymasters cannot select cards.\n"
-            "[b]OPERATIVE[/b] — does not see the key and selects the "
-            "cards.\n"
-            "Each team has one spymaster and at least one operative.\n\n"
-
-            "[b][color=#2DD4BF]TAKING A TURN[/color][/b]\n"
-            "The current team guesses a card by tapping it.\n"
-            "Revealing your own word keeps the turn going.\n"
-            "Revealing a neutral or enemy word passes the turn.\n\n"
-
-            "[b][color=#2DD4BF]THE ASSASSIN[/color][/b]\n"
-            "If a team chooses the Assassin, that team immediately "
-            "loses.\n\n"
-
-            "[b][color=#2DD4BF]WINNING[/color][/b]\n"
-            "A team wins by revealing all of its own cards first."
-        )
+        rules.text = self._rules_markup()
         panel.add_widget(rules)
 
         root.add_widget(panel)
 
         return root
-    # RETURN TO MENU    
+
+    def _rules_markup(self):
+        """How-to-play body, translated paragraph by paragraph."""
+
+        def heading(text):
+            return (
+                f"[b][color=#2DD4BF]{i18n.t(text)}[/color][/b]"
+            )
+
+        def bullet(colour, text):
+            return f"[color=#{colour}]● {i18n.t(text)}[/color]"
+
+        sections = [
+            heading("OBJECTIVE"),
+            i18n.t(
+                "Two teams race to find all of their words first."
+            ),
+            "",
+            heading("THE BOARD"),
+            i18n.t(
+                "The board holds 25 random words. Each word secretly "
+                "belongs to one of four categories:"
+            ),
+            bullet("E14B4B", "RED — a Red Team word"),
+            bullet("4C8DF6", "BLUE — a Blue Team word"),
+            bullet("8B96A8", "NEUTRAL — belongs to neither team"),
+            bullet("C05A5A", "ASSASSIN — picking it loses the game"),
+            "",
+            heading("ROLES"),
+            i18n.t(
+                "SPYMASTER — sees the secret key and gives clues "
+                "verbally. Spymasters cannot select cards."
+            ),
+            i18n.t(
+                "OPERATIVE — does not see the key and selects the cards."
+            ),
+            i18n.t(
+                "Each team has one spymaster and at least one operative."
+            ),
+            i18n.t(
+                "With one shared spymaster, the same player gives clues "
+                "for both teams."
+            ),
+            "",
+            heading("TAKING A TURN"),
+            i18n.t(
+                "The current team guesses a card by tapping it."
+            ),
+            i18n.t(
+                "Revealing your own word keeps the turn going."
+            ),
+            i18n.t(
+                "Revealing a neutral or enemy word passes the turn."
+            ),
+            "",
+            heading("THE ASSASSIN"),
+            i18n.t(
+                "If a team chooses the Assassin, that team immediately "
+                "loses."
+            ),
+            "",
+            heading("WINNING"),
+            i18n.t(
+                "A team wins by revealing all of its own cards first."
+            ),
+        ]
+
+        return "\n".join(sections)
+    # RETURN TO LOBBY / MENU
+    def return_to_lobby(self, instance=None):
+        """Leave the board but keep the group: back to the lobby intact."""
+
+        name = self._screen_name
+
+        host_side = name in ("host_game", "host_spymaster")
+
+        self.game_over = False
+        self.client_game_over = False
+        self.client_selection_pending = False
+        self._game_over_shown = False
+        self.game_over_root = None
+        self._overlay_root = None
+        self.reset_match_log()
+
+        # Match state only; teams and roles survive so the next round
+        # starts with the same players in the same seats.
+        self.revealed_cards = set()
+        self.cards = []
+        self.spymaster_cards = []
+        self.words = []
+        self.roles = []
+
+        if host_side:
+
+            if self.network_server is None:
+                self.return_to_menu(None)
+                return
+
+            self.network_server.broadcast({"type": "lobby_return"})
+            self.network_server.send_lobby_update()
+
+            if self.host_poll_event:
+                self.host_poll_event.cancel()
+
+            self.host_poll_event = Clock.schedule_interval(
+                self.update_host_lobby, 0.2
+            )
+
+            self.show_screen(self.create_host_screen, "host")
+
+            return
+
+        # Clients keep their seat in the lobby and wait for the host.
+        self.client_revealed = set()
+        self.client_revealed_roles = {}
+        self.client_cards = []
+        self.spymaster_cards = []
+        self.client_words = []
+        self.client_key_roles = []
+
+        if self.network_client is not None:
+
+            self.show_screen(
+                self.create_team_selection_screen,
+                "team_selection",
+            )
+
+            self.update_team_selection_lobby()
+
+            return
+
+        self.return_to_menu(None)
+
     def return_to_menu(self, instance):
 
         self.cleanup_network()

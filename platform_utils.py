@@ -373,6 +373,35 @@ def open_app_settings():
         return False
 
 
+def quit_app():
+    """Close the app from an in-app confirmation dialog.
+
+    Android has no public "exit" API, so finish the activity. On desktop
+    stop the Kivy event loop instead.
+    """
+
+    if IS_ANDROID:
+        try:
+            from android import mActivity
+
+            mActivity.finish()
+
+            return True
+
+        except Exception:
+            pass
+
+    try:
+        from kivy.app import App
+
+        App.get_running_app().stop()
+
+        return True
+
+    except Exception:
+        return False
+
+
 def vibrate(milliseconds=30):
     if not IS_ANDROID:
         return False

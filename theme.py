@@ -7,6 +7,8 @@ main.py and ui_widgets.py stay in sync with the approved design mock.
 
 from kivy.metrics import dp
 
+import i18n
+
 
 # ---------------------------------------------------------------------
 # RESPONSIVE BREAKPOINTS
@@ -175,6 +177,7 @@ FONT_HERO = dp(52)
 
 
 def safe_markup(value):
-    """Strip characters that would confuse Kivy's markup parser."""
+    """Return text safe for Kivy markup and shaped for RTL display."""
 
-    return str(value).replace("[", "(").replace("]", ")")
+    text = str(value).replace("[", "(").replace("]", ")")
+    return i18n.shape(text)

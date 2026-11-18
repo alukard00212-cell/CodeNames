@@ -16,6 +16,8 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
+import i18n
+
 from theme import (
     ACCENT,
     ACCENT_DARK,
@@ -281,8 +283,18 @@ class FlatButton(Button):
             state=self._sync_button,
             disabled=self._sync_button,
             selected=self._sync_button,
+            text=self._translate_text,
         )
+        self._translate_text()
         self._sync_button()
+
+    def _translate_text(self, *args):
+        """Translate the current label once; unknown text passes through."""
+
+        translated = i18n.t(self.text)
+
+        if translated != self.text:
+            self.text = translated
 
     def _palette(self):
         if self.disabled:
@@ -314,6 +326,13 @@ class FlatButton(Button):
             return (
                 SURFACE_HI,
                 mix(BORDER, team, 0.35),
+                TEXT,
+            )
+
+        if self.selected:
+            return (
+                mix(SURFACE_HI, ACCENT, 0.18),
+                ACCENT,
                 TEXT,
             )
 
@@ -385,7 +404,7 @@ class ScoreChip(BoxLayout):
             self._border = Line(width=dp(1))
 
         self.team_label = Label(
-            text=team.upper(),
+            text=i18n.t(team.upper()),
             font_size=dp(8) if compact else dp(10),
             bold=True,
             color=MUTED,
@@ -416,7 +435,7 @@ class ScoreChip(BoxLayout):
         self._sync_chip()
 
     def set_remaining(self, amount):
-        self.text = f"{self.team.upper()}: {amount}"
+        self.text = f"{i18n.t(self.team.upper())}: {amount}"
 
     def _on_text(self, *args):
         value = self.text or ""
@@ -593,7 +612,7 @@ class TurnBar(Panel):
 
     @text.setter
     def text(self, value):
-        self.label.text = value
+        self.label.text = i18n.t(value)
 
     def set_team(self, team, words_left=None, note=None, extra=None):
         colour = TEAM_COLORS.get(team, MUTED)
@@ -603,15 +622,20 @@ class TurnBar(Panel):
         self._edge_color.rgba = colour
         self.dot.set_colour(colour)
 
-        self.label.text = f"{str(team).upper()} TEAM TURN"
+        team_name = i18n.t(str(team).upper())
+
+        self.label.text = i18n.t("{team} TEAM TURN", team=team_name)
 
         if words_left is not None:
-            self.sub.text = f"{words_left} words remaining"
+            self.sub.text = i18n.t(
+                "{count} words remaining",
+                count=words_left,
+            )
         elif note is not None:
-            self.sub.text = note
+            self.sub.text = i18n.t(note)
 
         if extra is not None:
-            self.extra.text = extra
+            self.extra.text = i18n.t(extra)
             if extra:
                 self.extra.texture_update()
                 self.extra.width = self.extra.texture_size[0] + dp(2)
@@ -831,7 +855,7 @@ class KeyCard(BoardCard):
         marker = "  ×" if self.revealed else ""
         self.text = (
             f"{str(self.word).upper()}{marker}\n"
-            f"[size=9]{str(self.role).upper()}[/size]"
+            f"[size=9]{i18n.t(str(self.role).upper())}[/size]"
         )
         self.markup = True
 
@@ -895,6 +919,11 @@ class FlatInput(TextInput):
     """Rounded dark text input."""
 
     def __init__(self, **kwargs):
+        self.max_length = int(kwargs.pop("max_length", 0) or 0)
+
+        if kwargs.get("hint_text"):
+            kwargs["hint_text"] = i18n.t(kwargs["hint_text"])
+
         kwargs.setdefault("multiline", False)
         kwargs.setdefault("font_size", dp(15))
         kwargs.setdefault("background_normal", "")
@@ -921,8 +950,30 @@ class FlatInput(TextInput):
             pos=self._sync_input,
             size=self._sync_input,
             focus=self._sync_input,
+            text=self._clamp_text,
         )
         self._sync_input()
+        self._clamp_text(self, self.text)
+
+    def insert_text(self, substring, from_undo=False):
+        limit = int(getattr(self, "max_length", 0) or 0)
+
+        if limit > 0:
+            selection = self.selection_text or ""
+            allowed = limit - len(self.text) + len(selection)
+
+            if allowed <= 0:
+                return
+
+            substring = substring[:allowed]
+
+        return super().insert_text(substring, from_undo=from_undo)
+
+    def _clamp_text(self, instance, value):
+        limit = int(getattr(self, "max_length", 0) or 0)
+
+        if limit > 0 and len(value) > limit:
+            self.text = value[:limit]
 
     def _sync_input(self, *args):
         if self.width <= 0 or self.height <= 0:
@@ -949,7 +1000,7 @@ def heading(text, size=dp(26), colour=TEXT):
     """Convenience label factory used by the screens."""
 
     return Label(
-        text=text,
+        text=i18n.t(text),
         font_size=size,
         bold=True,
         color=colour,
@@ -962,7 +1013,7 @@ def heading(text, size=dp(26), colour=TEXT):
 
 def muted_label(text, size=dp(12), halign="left"):
     return Label(
-        text=text,
+        text=i18n.t(text),
         font_size=size,
         color=MUTED,
         halign=halign,

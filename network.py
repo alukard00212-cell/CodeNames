@@ -6,6 +6,8 @@ import socketserver
 import threading
 import time
 
+from settings import clean_player_name
+
 
 PORT = 5000
 
@@ -23,6 +25,9 @@ HOST_KEY = "__host__"
 
 ROLES = ("spymaster", "operative")
 TEAMS = ("red", "blue")
+
+# A shared spymaster (one for both teams) is stored as team "both".
+SHARED_TEAM = "both"
 
 
 # =========================================================
@@ -69,22 +74,26 @@ class ClientHandler(socketserver.StreamRequestHandler):
 
                 self.send_message({
                     "type": "error",
-                    "message": "Invalid join request."
+                    "reason": "invalid_join"
                 })
 
                 return
 
             # Get player information
-            player_name = str(
-                request.get("name", "Player")
-            ).strip()[:20] or "Player"
+            requested_name = clean_player_name(request.get("name"))
 
             # Assign team
             with self.server.players_lock:
 
+                # Two phones can keep the same saved name; make the
+                # lobby readable by adding a counter ("Ali (2)").
+                player_name = self.server.unique_player_name(
+                    requested_name
+                )
+
                 # Players choose their team in the lobby.
                 player_team = None
-                player_role = "operative"
+                player_role = None
 
                 self.server.players[player_key] = player_name
                 self.server.player_teams[player_key] = player_team
@@ -103,7 +112,8 @@ class ClientHandler(socketserver.StreamRequestHandler):
                 "player_key": player_key,
                 "team": player_team,
                 "role": player_role,
-                "lobby": self.server.get_lobby()
+                "lobby": self.server.get_lobby(),
+                "spymaster_mode": self.server.spymaster_mode,
             })
 
             self.server.events.put({
@@ -222,9 +232,15 @@ class GameTCPServer(socketserver.ThreadingTCPServer):
         self.player_teams = {}
         self.player_roles = {}
 
-        # The host is a player too (spymaster by default).
+        # The host is a player too. They pick a team and role in the
+        # lobby; the defaults keep a fresh lobby startable in mode 2.
+        self.host_name = "HOST"
         self.host_team = "red"
         self.host_role = "spymaster"
+
+        # 1 = one shared spymaster for both teams,
+        # 2 = one spymaster per team.
+        self.spymaster_mode = 2
 
         self.clients = {}
         self.clients_lock = threading.Lock()
@@ -237,11 +253,67 @@ class GameTCPServer(socketserver.ThreadingTCPServer):
         with self.players_lock:
             return list(self.players.values())
 
-    def _client_spymaster_taken(self, team, exclude_key=None):
+    def unique_player_name(self, name):
+        """Make a name unique inside the lobby. Caller holds players_lock."""
+
+        base = clean_player_name(name)
+        taken = set(self.players.values()) | {self.host_name}
+        candidate = base
+        counter = 2
+
+        while candidate in taken:
+            suffix = f" ({counter})"
+            candidate = base[: max(1, 24 - len(suffix))] + suffix
+            counter += 1
+
+        return candidate
+
+    def _valid_assignment(self, team, role):
+        """Is this team/role pair allowed by the current spymaster mode?"""
+
+        if team is None and role is None:
+            # "No role" is always a legal way to shuffle a full lobby.
+            return True
+
+        if role not in ROLES:
+            return False
+
+        if self.spymaster_mode == 1:
+            if role == "spymaster":
+                return team == SHARED_TEAM
+
+            return team in TEAMS
+
+        return team in TEAMS
+
+    def _spymaster_taken(self, team, exclude_key=None, exclude_host=False):
         """
-        Return True when another client already spies for `team`.
+        Return True when another player already spies for `team`.
         The caller must hold players_lock.
         """
+
+        if self.spymaster_mode == 1:
+            # One shared spymaster for the whole lobby.
+
+            if not exclude_host and self.host_role == "spymaster":
+                return True
+
+            for player_key in self.players:
+
+                if player_key == exclude_key:
+                    continue
+
+                if self.player_roles.get(player_key) == "spymaster":
+                    return True
+
+            return False
+
+        if (
+            not exclude_host
+            and self.host_role == "spymaster"
+            and self.host_team == team
+        ):
+            return True
 
         for player_key, player_team in self.player_teams.items():
 
@@ -259,60 +331,85 @@ class GameTCPServer(socketserver.ThreadingTCPServer):
     def set_player_assignment(self, player_key, team, role):
         """
         Atomically assign a client to a team and a role.
-        Only one spymaster is allowed per team.
+        A spymaster slot is unique (per team, or shared in mode 1).
         """
-
-        if team not in TEAMS:
-            return False
-
-        if role not in ROLES:
-            return False
 
         with self.players_lock:
 
             if player_key not in self.players:
                 return False
 
-            if role == "spymaster":
-
-                if self._client_spymaster_taken(
-                    team,
-                    exclude_key=player_key
-                ):
-                    return False
-
-                if (
-                    self.host_team == team
-                    and self.host_role == "spymaster"
-                ):
-                    return False
+            if not self._apply_assignment_for_client(
+                player_key, team, role
+            ):
+                return False
 
             self.player_teams[player_key] = team
             self.player_roles[player_key] = role
 
         return True
 
+    def _apply_assignment_for_client(self, player_key, team, role):
+        if not self._valid_assignment(team, role):
+            return False
+
+        if role != "spymaster":
+            return True
+
+        return not self._spymaster_taken(
+            team, exclude_key=player_key
+        )
+
     def set_host_assignment(self, team, role):
         """
-        Assign the host's own team and role.
+        Assign the host's own team and role (None clears the slot).
         """
-
-        if team not in TEAMS:
-            return False
-
-        if role not in ROLES:
-            return False
 
         with self.players_lock:
 
-            if (
-                role == "spymaster"
-                and self._client_spymaster_taken(team)
+            if not self._valid_assignment(team, role):
+                return False
+
+            if role == "spymaster" and self._spymaster_taken(
+                team, exclude_host=True
             ):
                 return False
 
             self.host_team = team
             self.host_role = role
+
+        return True
+
+    def set_spymaster_mode(self, mode):
+        """Switch modes and clear every spymaster assignment."""
+
+        try:
+            mode = int(mode)
+        except (TypeError, ValueError):
+            return False
+
+        if mode not in (1, 2):
+            return False
+
+        with self.players_lock:
+
+            self.spymaster_mode = mode
+
+            if (
+                self.host_role == "spymaster"
+                or self.host_team == SHARED_TEAM
+            ):
+                self.host_team = None
+                self.host_role = None
+
+            for player_key in list(self.player_roles):
+
+                if (
+                    self.player_roles.get(player_key) == "spymaster"
+                    or self.player_teams.get(player_key) == SHARED_TEAM
+                ):
+                    self.player_teams[player_key] = None
+                    self.player_roles[player_key] = None
 
         return True
     # Tell every client the lobby is closing, then drop their sockets
@@ -406,6 +503,35 @@ class GameTCPServer(socketserver.ThreadingTCPServer):
         except (OSError, ConnectionError):
             pass
 
+    def send_to_spymasters(self, message):
+        """Send the secret key to every client acting as a spymaster."""
+
+        with self.players_lock:
+
+            target_keys = [
+                player_key
+                for player_key in self.players
+                if self.player_roles.get(player_key) == "spymaster"
+            ]
+
+        with self.clients_lock:
+
+            targets = [
+                self.clients.get(player_key)
+                for player_key in target_keys
+            ]
+
+        for client in targets:
+
+            if client is None:
+                continue
+
+            try:
+                client.send_message(message)
+
+            except (OSError, ConnectionError):
+                pass
+
     def get_lobby(self):
 
         lobby = []
@@ -414,25 +540,34 @@ class GameTCPServer(socketserver.ThreadingTCPServer):
 
             # The host is part of the lobby, but has no TCP connection.
             lobby.append({
-                "name": "HOST",
+                "name": self.host_name or "HOST",
                 "key": HOST_KEY,
                 "team": self.host_team,
                 "role": self.host_role,
-                "is_host": True
+                "is_host": True,
+                "is_shared": self.host_team == SHARED_TEAM,
             })
 
             for player_key, player_name in self.players.items():
 
+                player_team = self.player_teams.get(player_key)
+
                 lobby.append({
                     "name": player_name,
                     "key": player_key,
-                    "team": self.player_teams.get(player_key),
+                    "team": player_team,
                     "role": self.player_roles.get(
                         player_key,
                         "operative"
                     ),
-                    "is_host": False
+                    "is_host": False,
+                    "is_shared": player_team == SHARED_TEAM,
                 })
+
+            mode = self.spymaster_mode
+
+        for entry in lobby:
+            entry["spymaster_mode"] = mode
 
         return lobby
 
@@ -499,7 +634,8 @@ class GameServer:
 
         self.server.broadcast({
             "type": "lobby_update",
-            "lobby": self.server.get_lobby()
+            "lobby": self.server.get_lobby(),
+            "spymaster_mode": self.server.spymaster_mode,
         })
 
     def send_to_role(self, team, role, message):
@@ -510,6 +646,11 @@ class GameServer:
                 role,
                 message
             )
+
+    def send_to_spymasters(self, message):
+
+        if self.server is not None:
+            self.server.send_to_spymasters(message)
 
     def send_to_player(self, player_key, message):
 
@@ -527,7 +668,7 @@ class GameServer:
             # for a dead socket.
             self.server.disconnect_all({
                 "type": "disconnected",
-                "message": "The host closed the lobby."
+                "reason": "host_closed"
             })
 
             self.server.shutdown()
@@ -934,6 +1075,7 @@ def _parse_discovery_reply(data, address):
         "host": host,
         "port": port,
         "ssid": str(info.get("ssid") or "").strip(),
+        "host_name": str(info.get("host_name") or "").strip(),
         "kind": str(info.get("kind") or "WI-FI").strip() or "WI-FI",
         "players": max(1, players),
         "max": int(info.get("max") or 8),
